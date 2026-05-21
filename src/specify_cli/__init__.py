@@ -6,7 +6,9 @@
 #     "rich",
 #     "platformdirs",
 #     "readchar",
-#     "httpx",
+#     "json5",
+#     "pyyaml",
+#     "packaging",
 # ]
 # ///
 """
@@ -25,265 +27,96 @@ Or install globally:
 """
 
 import os
-import subprocess
 import sys
 import zipfile
-import tempfile
 import shutil
-import shlex
 import json
+import shlex
 import yaml
 from pathlib import Path
-from typing import Optional, Tuple
+
+from typing import Any, Optional
 
 import typer
-import httpx
-from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.text import Text
 from rich.live import Live
 from rich.align import Align
 from rich.table import Table
-from rich.tree import Tree
-from typer.core import TyperGroup
+from .integration_runtime import (
+    invoke_separator_for_integration as _invoke_separator_for_integration,
+    resolve_integration_options as _resolve_integration_options_impl,
+    with_integration_setting as _with_integration_setting,
+)
+from .integration_state import (
+    INTEGRATION_JSON,
+    INTEGRATION_STATE_SCHEMA,
+    dedupe_integration_keys as _dedupe_integration_keys,
+    default_integration_key as _default_integration_key,
+    installed_integration_keys as _installed_integration_keys,
+    integration_setting as _integration_setting,
+    integration_settings as _integration_settings,
+    try_read_integration_json as _try_read_integration_json,
+    write_integration_json as _write_integration_json_file,
+)
+from .shared_infra import (
+    install_shared_infra as _install_shared_infra_impl,
+    refresh_shared_templates as _refresh_shared_templates_impl,
+)
 
-# For cross-platform keyboard input
-import readchar
-import ssl
-import truststore
-from datetime import datetime, timezone
+from ._console import (
+    BANNER as BANNER,
+    TAGLINE as TAGLINE,
+    BannerGroup,
+    StepTracker,
+    console,
+    get_key as get_key,
+    select_with_arrows,
+    show_banner,
+)
+from ._assets import (
+    _locate_bundled_extension,
+    _locate_bundled_preset,
+    _locate_bundled_workflow,
+    _locate_core_pack,
+    _repo_root,
+    get_speckit_version as get_speckit_version,
+)
+from ._utils import (
+    CLAUDE_LOCAL_PATH as CLAUDE_LOCAL_PATH,
+    CLAUDE_NPM_LOCAL_PATH as CLAUDE_NPM_LOCAL_PATH,
+    _display_project_path,
+    check_tool as check_tool,
+    handle_vscode_settings as handle_vscode_settings,
+    init_git_repo as init_git_repo,
+    is_git_repo as is_git_repo,
+    merge_json_files as merge_json_files,
+    run_command as run_command,
+)
+from ._version import (
+    GITHUB_API_LATEST as GITHUB_API_LATEST,
+    self_app as _self_app,
+    self_check as self_check,
+    self_upgrade as self_upgrade,
+)
 
-ssl_context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-client = httpx.Client(verify=ssl_context)
+def _build_agent_config() -> dict[str, dict[str, Any]]:
+    """Derive AGENT_CONFIG from INTEGRATION_REGISTRY."""
+    from .integrations import INTEGRATION_REGISTRY
+    config: dict[str, dict[str, Any]] = {}
+    for key, integration in INTEGRATION_REGISTRY.items():
+        if integration.config:
+            config[key] = dict(integration.config)
+    return config
 
-def _github_token(cli_token: str | None = None) -> str | None:
-    """Return sanitized GitHub token (cli arg takes precedence) or None."""
-    return ((cli_token or os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN") or "").strip()) or None
-
-def _github_auth_headers(cli_token: str | None = None) -> dict:
-    """Return Authorization header dict only when a non-empty token exists."""
-    token = _github_token(cli_token)
-    return {"Authorization": f"Bearer {token}"} if token else {}
-
-def _parse_rate_limit_headers(headers: httpx.Headers) -> dict:
-    """Extract and parse GitHub rate-limit headers."""
-    info = {}
-    
-    # Standard GitHub rate-limit headers
-    if "X-RateLimit-Limit" in headers:
-        info["limit"] = headers.get("X-RateLimit-Limit")
-    if "X-RateLimit-Remaining" in headers:
-        info["remaining"] = headers.get("X-RateLimit-Remaining")
-    if "X-RateLimit-Reset" in headers:
-        reset_epoch = int(headers.get("X-RateLimit-Reset", "0"))
-        if reset_epoch:
-            reset_time = datetime.fromtimestamp(reset_epoch, tz=timezone.utc)
-            info["reset_epoch"] = reset_epoch
-            info["reset_time"] = reset_time
-            info["reset_local"] = reset_time.astimezone()
-    
-    # Retry-After header (seconds or HTTP-date)
-    if "Retry-After" in headers:
-        retry_after = headers.get("Retry-After")
-        try:
-            info["retry_after_seconds"] = int(retry_after)
-        except ValueError:
-            # HTTP-date format - not implemented, just store as string
-            info["retry_after"] = retry_after
-    
-    return info
-
-def _format_rate_limit_error(status_code: int, headers: httpx.Headers, url: str) -> str:
-    """Format a user-friendly error message with rate-limit information."""
-    rate_info = _parse_rate_limit_headers(headers)
-    
-    lines = [f"GitHub API returned status {status_code} for {url}"]
-    lines.append("")
-    
-    if rate_info:
-        lines.append("[bold]Rate Limit Information:[/bold]")
-        if "limit" in rate_info:
-            lines.append(f"  • Rate Limit: {rate_info['limit']} requests/hour")
-        if "remaining" in rate_info:
-            lines.append(f"  • Remaining: {rate_info['remaining']}")
-        if "reset_local" in rate_info:
-            reset_str = rate_info["reset_local"].strftime("%Y-%m-%d %H:%M:%S %Z")
-            lines.append(f"  • Resets at: {reset_str}")
-        if "retry_after_seconds" in rate_info:
-            lines.append(f"  • Retry after: {rate_info['retry_after_seconds']} seconds")
-        lines.append("")
-    
-    # Add troubleshooting guidance
-    lines.append("[bold]Troubleshooting Tips:[/bold]")
-    lines.append("  • If you're on a shared CI or corporate environment, you may be rate-limited.")
-    lines.append("  • Consider using a GitHub token via --github-token or the GH_TOKEN/GITHUB_TOKEN")
-    lines.append("    environment variable to increase rate limits.")
-    lines.append("  • Authenticated requests have a limit of 5,000/hour vs 60/hour for unauthenticated.")
-    
-    return "\n".join(lines)
-
-# Agent configuration with name, folder, install URL, CLI tool requirement, and commands subdirectory
-AGENT_CONFIG = {
-    "copilot": {
-        "name": "GitHub Copilot",
-        "folder": ".github/",
-        "commands_subdir": "agents",  # Special: uses agents/ not commands/
-        "install_url": None,  # IDE-based, no CLI check needed
-        "requires_cli": False,
-    },
-    "claude": {
-        "name": "Claude Code",
-        "folder": ".claude/",
-        "commands_subdir": "commands",
-        "install_url": "https://docs.anthropic.com/en/docs/claude-code/setup",
-        "requires_cli": True,
-    },
-    "gemini": {
-        "name": "Gemini CLI",
-        "folder": ".gemini/",
-        "commands_subdir": "commands",
-        "install_url": "https://github.com/google-gemini/gemini-cli",
-        "requires_cli": True,
-    },
-    "cursor-agent": {
-        "name": "Cursor",
-        "folder": ".cursor/",
-        "commands_subdir": "commands",
-        "install_url": None,  # IDE-based
-        "requires_cli": False,
-    },
-    "qwen": {
-        "name": "Qwen Code",
-        "folder": ".qwen/",
-        "commands_subdir": "commands",
-        "install_url": "https://github.com/QwenLM/qwen-code",
-        "requires_cli": True,
-    },
-    "opencode": {
-        "name": "opencode",
-        "folder": ".opencode/",
-        "commands_subdir": "command",  # Special: singular 'command' not 'commands'
-        "install_url": "https://opencode.ai",
-        "requires_cli": True,
-    },
-    "codex": {
-        "name": "Codex CLI",
-        "folder": ".codex/",
-        "commands_subdir": "prompts",  # Special: uses prompts/ not commands/
-        "install_url": "https://github.com/openai/codex",
-        "requires_cli": True,
-    },
-    "windsurf": {
-        "name": "Windsurf",
-        "folder": ".windsurf/",
-        "commands_subdir": "workflows",  # Special: uses workflows/ not commands/
-        "install_url": None,  # IDE-based
-        "requires_cli": False,
-    },
-    "kilocode": {
-        "name": "Kilo Code",
-        "folder": ".kilocode/",
-        "commands_subdir": "workflows",  # Special: uses workflows/ not commands/
-        "install_url": None,  # IDE-based
-        "requires_cli": False,
-    },
-    "auggie": {
-        "name": "Auggie CLI",
-        "folder": ".augment/",
-        "commands_subdir": "commands",
-        "install_url": "https://docs.augmentcode.com/cli/setup-auggie/install-auggie-cli",
-        "requires_cli": True,
-    },
-    "codebuddy": {
-        "name": "CodeBuddy",
-        "folder": ".codebuddy/",
-        "commands_subdir": "commands",
-        "install_url": "https://www.codebuddy.ai/cli",
-        "requires_cli": True,
-    },
-    "qodercli": {
-        "name": "Qoder CLI",
-        "folder": ".qoder/",
-        "commands_subdir": "commands",
-        "install_url": "https://qoder.com/cli",
-        "requires_cli": True,
-    },
-    "roo": {
-        "name": "Roo Code",
-        "folder": ".roo/",
-        "commands_subdir": "commands",
-        "install_url": None,  # IDE-based
-        "requires_cli": False,
-    },
-    "kiro-cli": {
-        "name": "Kiro CLI",
-        "folder": ".kiro/",
-        "commands_subdir": "prompts",  # Special: uses prompts/ not commands/
-        "install_url": "https://kiro.dev/docs/cli/",
-        "requires_cli": True,
-    },
-    "amp": {
-        "name": "Amp",
-        "folder": ".agents/",
-        "commands_subdir": "commands",
-        "install_url": "https://ampcode.com/manual#install",
-        "requires_cli": True,
-    },
-    "shai": {
-        "name": "SHAI",
-        "folder": ".shai/",
-        "commands_subdir": "commands",
-        "install_url": "https://github.com/ovh/shai",
-        "requires_cli": True,
-    },
-    "tabnine": {
-        "name": "Tabnine CLI",
-        "folder": ".tabnine/agent/",
-        "commands_subdir": "commands",
-        "install_url": "https://docs.tabnine.com/main/getting-started/tabnine-cli",
-        "requires_cli": True,
-    },
-    "agy": {
-        "name": "Antigravity",
-        "folder": ".agent/",
-        "commands_subdir": "commands",
-        "install_url": None,  # IDE-based
-        "requires_cli": False,
-    },
-    "bob": {
-        "name": "IBM Bob",
-        "folder": ".bob/",
-        "commands_subdir": "commands",
-        "install_url": None,  # IDE-based
-        "requires_cli": False,
-    },
-    "vibe": {
-        "name": "Mistral Vibe",
-        "folder": ".vibe/",
-        "commands_subdir": "prompts",
-        "install_url": "https://github.com/mistralai/mistral-vibe",
-        "requires_cli": True,
-    },
-    "kimi": {
-        "name": "Kimi Code",
-        "folder": ".kimi/",
-        "commands_subdir": "skills",  # Kimi uses /skill:<name> with .kimi/skills/<name>/SKILL.md
-        "install_url": "https://code.kimi.com/",
-        "requires_cli": True,
-    },
-    "generic": {
-        "name": "Generic (bring your own agent)",
-        "folder": None,  # Set dynamically via --ai-commands-dir
-        "commands_subdir": "commands",
-        "install_url": None,
-        "requires_cli": False,
-    },
-}
+AGENT_CONFIG = _build_agent_config()
+DEFAULT_INIT_INTEGRATION = "copilot"
 
 AI_ASSISTANT_ALIASES = {
     "kiro": "kiro-cli",
 }
+
+# Agents that use TOML command format (others use Markdown)
+_TOML_AGENTS = frozenset({"gemini", "tabnine"})
 
 def _build_ai_assistant_help() -> str:
     """Build the --ai help text from AGENT_CONFIG so it stays in sync with runtime config."""
@@ -309,210 +142,40 @@ def _build_ai_assistant_help() -> str:
     return base_help + " Use " + aliases_text + "."
 AI_ASSISTANT_HELP = _build_ai_assistant_help()
 
-SCRIPT_TYPE_CHOICES = {"sh": "POSIX Shell (bash/zsh)", "ps": "PowerShell"}
 
-CLAUDE_LOCAL_PATH = Path.home() / ".claude" / "local" / "claude"
+def _build_integration_equivalent(
+    integration_key: str,
+    ai_commands_dir: str | None = None,
+) -> str:
+    """Build the modern --integration equivalent for legacy --ai usage."""
 
-BANNER = """
-███████╗██████╗ ███████╗ ██████╗██╗███████╗██╗   ██╗
-██╔════╝██╔══██╗██╔════╝██╔════╝██║██╔════╝╚██╗ ██╔╝
-███████╗██████╔╝█████╗  ██║     ██║█████╗   ╚████╔╝ 
-╚════██║██╔═══╝ ██╔══╝  ██║     ██║██╔══╝    ╚██╔╝  
-███████║██║     ███████╗╚██████╗██║██║        ██║   
-╚══════╝╚═╝     ╚══════╝ ╚═════╝╚═╝╚═╝        ╚═╝   
-"""
-
-TAGLINE = "GitHub Spec Kit - Spec-Driven Development Toolkit"
-class StepTracker:
-    """Track and render hierarchical steps without emojis, similar to Claude Code tree output.
-    Supports live auto-refresh via an attached refresh callback.
-    """
-    def __init__(self, title: str):
-        self.title = title
-        self.steps = []  # list of dicts: {key, label, status, detail}
-        self.status_order = {"pending": 0, "running": 1, "done": 2, "error": 3, "skipped": 4}
-        self._refresh_cb = None  # callable to trigger UI refresh
-
-    def attach_refresh(self, cb):
-        self._refresh_cb = cb
-
-    def add(self, key: str, label: str):
-        if key not in [s["key"] for s in self.steps]:
-            self.steps.append({"key": key, "label": label, "status": "pending", "detail": ""})
-            self._maybe_refresh()
-
-    def start(self, key: str, detail: str = ""):
-        self._update(key, status="running", detail=detail)
-
-    def complete(self, key: str, detail: str = ""):
-        self._update(key, status="done", detail=detail)
-
-    def error(self, key: str, detail: str = ""):
-        self._update(key, status="error", detail=detail)
-
-    def skip(self, key: str, detail: str = ""):
-        self._update(key, status="skipped", detail=detail)
-
-    def _update(self, key: str, status: str, detail: str):
-        for s in self.steps:
-            if s["key"] == key:
-                s["status"] = status
-                if detail:
-                    s["detail"] = detail
-                self._maybe_refresh()
-                return
-
-        self.steps.append({"key": key, "label": key, "status": status, "detail": detail})
-        self._maybe_refresh()
-
-    def _maybe_refresh(self):
-        if self._refresh_cb:
-            try:
-                self._refresh_cb()
-            except Exception:
-                pass
-
-    def render(self):
-        tree = Tree(f"[cyan]{self.title}[/cyan]", guide_style="grey50")
-        for step in self.steps:
-            label = step["label"]
-            detail_text = step["detail"].strip() if step["detail"] else ""
-
-            status = step["status"]
-            if status == "done":
-                symbol = "[green]●[/green]"
-            elif status == "pending":
-                symbol = "[green dim]○[/green dim]"
-            elif status == "running":
-                symbol = "[cyan]○[/cyan]"
-            elif status == "error":
-                symbol = "[red]●[/red]"
-            elif status == "skipped":
-                symbol = "[yellow]○[/yellow]"
-            else:
-                symbol = " "
-
-            if status == "pending":
-                # Entire line light gray (pending)
-                if detail_text:
-                    line = f"{symbol} [bright_black]{label} ({detail_text})[/bright_black]"
-                else:
-                    line = f"{symbol} [bright_black]{label}[/bright_black]"
-            else:
-                # Label white, detail (if any) light gray in parentheses
-                if detail_text:
-                    line = f"{symbol} [white]{label}[/white] [bright_black]({detail_text})[/bright_black]"
-                else:
-                    line = f"{symbol} [white]{label}[/white]"
-
-            tree.add(line)
-        return tree
-
-def get_key():
-    """Get a single keypress in a cross-platform way using readchar."""
-    key = readchar.readkey()
-
-    if key == readchar.key.UP or key == readchar.key.CTRL_P:
-        return 'up'
-    if key == readchar.key.DOWN or key == readchar.key.CTRL_N:
-        return 'down'
-
-    if key == readchar.key.ENTER:
-        return 'enter'
-
-    if key == readchar.key.ESC:
-        return 'escape'
-
-    if key == readchar.key.CTRL_C:
-        raise KeyboardInterrupt
-
-    return key
-
-def select_with_arrows(options: dict, prompt_text: str = "Select an option", default_key: str = None) -> str:
-    """
-    Interactive selection using arrow keys with Rich Live display.
-    
-    Args:
-        options: Dict with keys as option keys and values as descriptions
-        prompt_text: Text to show above the options
-        default_key: Default option key to start with
-        
-    Returns:
-        Selected option key
-    """
-    option_keys = list(options.keys())
-    if default_key and default_key in option_keys:
-        selected_index = option_keys.index(default_key)
-    else:
-        selected_index = 0
-
-    selected_key = None
-
-    def create_selection_panel():
-        """Create the selection panel with current selection highlighted."""
-        table = Table.grid(padding=(0, 2))
-        table.add_column(style="cyan", justify="left", width=3)
-        table.add_column(style="white", justify="left")
-
-        for i, key in enumerate(option_keys):
-            if i == selected_index:
-                table.add_row("▶", f"[cyan]{key}[/cyan] [dim]({options[key]})[/dim]")
-            else:
-                table.add_row(" ", f"[cyan]{key}[/cyan] [dim]({options[key]})[/dim]")
-
-        table.add_row("", "")
-        table.add_row("", "[dim]Use ↑/↓ to navigate, Enter to select, Esc to cancel[/dim]")
-
-        return Panel(
-            table,
-            title=f"[bold]{prompt_text}[/bold]",
-            border_style="cyan",
-            padding=(1, 2)
+    parts = [f"--integration {integration_key}"]
+    if integration_key == "generic" and ai_commands_dir:
+        parts.append(
+            f'--integration-options="--commands-dir {shlex.quote(ai_commands_dir)}"'
         )
+    return " ".join(parts)
 
-    console.print()
 
-    def run_selection_loop():
-        nonlocal selected_key, selected_index
-        with Live(create_selection_panel(), console=console, transient=True, auto_refresh=False) as live:
-            while True:
-                try:
-                    key = get_key()
-                    if key == 'up':
-                        selected_index = (selected_index - 1) % len(option_keys)
-                    elif key == 'down':
-                        selected_index = (selected_index + 1) % len(option_keys)
-                    elif key == 'enter':
-                        selected_key = option_keys[selected_index]
-                        break
-                    elif key == 'escape':
-                        console.print("\n[yellow]Selection cancelled[/yellow]")
-                        raise typer.Exit(1)
+def _build_ai_deprecation_warning(
+    integration_key: str,
+    ai_commands_dir: str | None = None,
+) -> str:
+    """Build the legacy --ai deprecation warning message."""
 
-                    live.update(create_selection_panel(), refresh=True)
+    replacement = _build_integration_equivalent(
+        integration_key,
+        ai_commands_dir=ai_commands_dir,
+    )
+    return (
+        "[bold]--ai[/bold] is deprecated and will no longer be available in version 0.10.0 or later.\n\n"
+        f"Use [bold]{replacement}[/bold] instead."
+    )
 
-                except KeyboardInterrupt:
-                    console.print("\n[yellow]Selection cancelled[/yellow]")
-                    raise typer.Exit(1)
+def _stdin_is_interactive() -> bool:
+    return sys.stdin.isatty()
 
-    run_selection_loop()
-
-    if selected_key is None:
-        console.print("\n[red]Selection failed.[/red]")
-        raise typer.Exit(1)
-
-    return selected_key
-
-console = Console()
-
-class BannerGroup(TyperGroup):
-    """Custom group that shows banner before help."""
-
-    def format_help(self, ctx, formatter):
-        # Show banner before help
-        show_banner()
-        super().format_help(ctx, formatter)
-
+SCRIPT_TYPE_CHOICES = {"sh": "POSIX Shell (bash/zsh)", "ps": "PowerShell"}
 
 app = typer.Typer(
     name="specify",
@@ -522,504 +185,158 @@ app = typer.Typer(
     cls=BannerGroup,
 )
 
-def show_banner():
-    """Display the ASCII art banner."""
-    banner_lines = BANNER.strip().split('\n')
-    colors = ["bright_blue", "blue", "cyan", "bright_cyan", "white", "bright_white"]
-
-    styled_banner = Text()
-    for i, line in enumerate(banner_lines):
-        color = colors[i % len(colors)]
-        styled_banner.append(line + "\n", style=color)
-
-    console.print(Align.center(styled_banner))
-    console.print(Align.center(Text(TAGLINE, style="italic bright_yellow")))
-    console.print()
+def _version_callback(value: bool):
+    if value:
+        console.print(f"specify {get_speckit_version()}")
+        raise typer.Exit()
 
 @app.callback()
-def callback(ctx: typer.Context):
+def callback(
+    ctx: typer.Context,
+    version: bool = typer.Option(False, "--version", "-V", callback=_version_callback, is_eager=True, help="Show version and exit."),
+):
     """Show banner when no subcommand is provided."""
     if ctx.invoked_subcommand is None and "--help" not in sys.argv and "-h" not in sys.argv:
         show_banner()
         console.print(Align.center("[dim]Run 'specify --help' for usage information[/dim]"))
         console.print()
 
-def run_command(cmd: list[str], check_return: bool = True, capture: bool = False, shell: bool = False) -> Optional[str]:
-    """Run a shell command and optionally capture output."""
-    try:
-        if capture:
-            result = subprocess.run(cmd, check=check_return, capture_output=True, text=True, shell=shell)
-            return result.stdout.strip()
-        else:
-            subprocess.run(cmd, check=check_return, shell=shell)
-            return None
-    except subprocess.CalledProcessError as e:
-        if check_return:
-            console.print(f"[red]Error running command:[/red] {' '.join(cmd)}")
-            console.print(f"[red]Exit code:[/red] {e.returncode}")
-            if hasattr(e, 'stderr') and e.stderr:
-                console.print(f"[red]Error output:[/red] {e.stderr}")
-            raise
-        return None
+def _refresh_shared_templates(
+    project_path: Path,
+    *,
+    invoke_separator: str,
+    force: bool = False,
+) -> None:
+    """Refresh default-sensitive shared templates without touching scripts."""
+    _refresh_shared_templates_impl(
+        project_path,
+        version=get_speckit_version(),
+        core_pack=_locate_core_pack(),
+        repo_root=_repo_root(),
+        console=console,
+        invoke_separator=invoke_separator,
+        force=force,
+    )
 
-def check_tool(tool: str, tracker: StepTracker = None) -> bool:
-    """Check if a tool is installed. Optionally update tracker.
-    
-    Args:
-        tool: Name of the tool to check
-        tracker: Optional StepTracker to update with results
-        
-    Returns:
-        True if tool is found, False otherwise
+
+def _install_shared_infra(
+    project_path: Path,
+    script_type: str,
+    tracker: StepTracker | None = None,
+    force: bool = False,
+    invoke_separator: str = ".",
+    refresh_managed: bool = False,
+    refresh_hint: str | None = None,
+) -> bool:
+    """Install shared infrastructure files into *project_path*.
+
+    Copies ``.specify/scripts/<variant>/`` and ``.specify/templates/`` from
+    the bundled core_pack or source checkout, where ``<variant>`` is
+    ``bash`` when *script_type* is ``"sh"`` and ``powershell`` when it is
+    ``"ps"``.  Tracks all installed files in ``speckit.manifest.json``.
+
+    Page templates are processed to resolve ``__SPECKIT_COMMAND_<NAME>__``
+    placeholders using *invoke_separator* (``"."`` for markdown agents,
+    ``"-"`` for skills agents).
+
+    Overwrite policy:
+
+    * ``force=True``  — overwrite every existing file (still skips symlinks
+      to avoid following links outside the project root).
+    * ``refresh_managed=True`` — overwrite only files whose on-disk hash
+      still matches the previously recorded manifest hash (i.e. unmodified
+      files installed by spec-kit). Files with diverging hashes are
+      treated as user customizations and preserved with a warning.
+    * Default — only add missing files; existing ones are skipped.
+
+    *refresh_hint* — caller-supplied rich-text fragment shown after the
+    "Preserved customized files" warning to tell the user which flag/command
+    they should re-run with to overwrite their customizations. Each caller
+    passes the flag that's actually valid in its CLI surface (e.g.
+    ``--refresh-shared-infra`` for ``integration switch``,
+    ``--force`` for ``init``/``integration upgrade``). When ``None``, no
+    remediation hint is printed for customizations.
+
+    Returns ``True`` on success.
     """
-    # Special handling for Claude CLI after `claude migrate-installer`
-    # See: https://github.com/github/spec-kit/issues/123
-    # The migrate-installer command REMOVES the original executable from PATH
-    # and creates an alias at ~/.claude/local/claude instead
-    # This path should be prioritized over other claude executables in PATH
-    if tool == "claude":
-        if CLAUDE_LOCAL_PATH.exists() and CLAUDE_LOCAL_PATH.is_file():
-            if tracker:
-                tracker.complete(tool, "available")
-            return True
-    
-    if tool == "kiro-cli":
-        # Kiro currently supports both executable names. Prefer kiro-cli and
-        # accept kiro as a compatibility fallback.
-        found = shutil.which("kiro-cli") is not None or shutil.which("kiro") is not None
-    else:
-        found = shutil.which(tool) is not None
-    
-    if tracker:
-        if found:
-            tracker.complete(tool, "available")
-        else:
-            tracker.error(tool, "not found")
-    
-    return found
+    return _install_shared_infra_impl(
+        project_path,
+        script_type,
+        version=get_speckit_version(),
+        core_pack=_locate_core_pack(),
+        repo_root=_repo_root(),
+        console=console,
+        force=force,
+        invoke_separator=invoke_separator,
+        refresh_managed=refresh_managed,
+        refresh_hint=refresh_hint,
+    )
 
-def is_git_repo(path: Path = None) -> bool:
-    """Check if the specified path is inside a git repository."""
-    if path is None:
-        path = Path.cwd()
-    
-    if not path.is_dir():
-        return False
 
+def _install_shared_infra_or_exit(
+    project_path: Path,
+    script_type: str,
+    tracker: StepTracker | None = None,
+    force: bool = False,
+    invoke_separator: str = ".",
+    refresh_managed: bool = False,
+    refresh_hint: str | None = None,
+) -> bool:
     try:
-        # Use git command to check if inside a work tree
-        subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            check=True,
-            capture_output=True,
-            cwd=path,
+        return _install_shared_infra(
+            project_path,
+            script_type,
+            tracker=tracker,
+            force=force,
+            invoke_separator=invoke_separator,
+            refresh_managed=refresh_managed,
+            refresh_hint=refresh_hint,
         )
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
-
-def init_git_repo(project_path: Path, quiet: bool = False) -> Tuple[bool, Optional[str]]:
-    """Initialize a git repository in the specified path.
-    
-    Args:
-        project_path: Path to initialize git repository in
-        quiet: if True suppress console output (tracker handles status)
-    
-    Returns:
-        Tuple of (success: bool, error_message: Optional[str])
-    """
-    try:
-        original_cwd = Path.cwd()
-        os.chdir(project_path)
-        if not quiet:
-            console.print("[cyan]Initializing git repository...[/cyan]")
-        subprocess.run(["git", "init"], check=True, capture_output=True, text=True)
-        subprocess.run(["git", "add", "."], check=True, capture_output=True, text=True)
-        subprocess.run(["git", "commit", "-m", "Initial commit from Specify template"], check=True, capture_output=True, text=True)
-        if not quiet:
-            console.print("[green]✓[/green] Git repository initialized")
-        return True, None
-
-    except subprocess.CalledProcessError as e:
-        error_msg = f"Command: {' '.join(e.cmd)}\nExit code: {e.returncode}"
-        if e.stderr:
-            error_msg += f"\nError: {e.stderr.strip()}"
-        elif e.stdout:
-            error_msg += f"\nOutput: {e.stdout.strip()}"
-        
-        if not quiet:
-            console.print(f"[red]Error initializing git repository:[/red] {e}")
-        return False, error_msg
-    finally:
-        os.chdir(original_cwd)
-
-def handle_vscode_settings(sub_item, dest_file, rel_path, verbose=False, tracker=None) -> None:
-    """Handle merging or copying of .vscode/settings.json files."""
-    def log(message, color="green"):
-        if verbose and not tracker:
-            console.print(f"[{color}]{message}[/] {rel_path}")
-
-    try:
-        with open(sub_item, 'r', encoding='utf-8') as f:
-            new_settings = json.load(f)
-
-        if dest_file.exists():
-            merged = merge_json_files(dest_file, new_settings, verbose=verbose and not tracker)
-            with open(dest_file, 'w', encoding='utf-8') as f:
-                json.dump(merged, f, indent=4)
-                f.write('\n')
-            log("Merged:", "green")
-        else:
-            shutil.copy2(sub_item, dest_file)
-            log("Copied (no existing settings.json):", "blue")
-
-    except Exception as e:
-        log(f"Warning: Could not merge, copying instead: {e}", "yellow")
-        shutil.copy2(sub_item, dest_file)
-
-def merge_json_files(existing_path: Path, new_content: dict, verbose: bool = False) -> dict:
-    """Merge new JSON content into existing JSON file.
-
-    Performs a deep merge where:
-    - New keys are added
-    - Existing keys are preserved unless overwritten by new content
-    - Nested dictionaries are merged recursively
-    - Lists and other values are replaced (not merged)
-
-    Args:
-        existing_path: Path to existing JSON file
-        new_content: New JSON content to merge in
-        verbose: Whether to print merge details
-
-    Returns:
-        Merged JSON content as dict
-    """
-    try:
-        with open(existing_path, 'r', encoding='utf-8') as f:
-            existing_content = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        # If file doesn't exist or is invalid, just use new content
-        return new_content
-
-    def deep_merge(base: dict, update: dict) -> dict:
-        """Recursively merge update dict into base dict."""
-        result = base.copy()
-        for key, value in update.items():
-            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-                # Recursively merge nested dictionaries
-                result[key] = deep_merge(result[key], value)
-            else:
-                # Add new key or replace existing value
-                result[key] = value
-        return result
-
-    merged = deep_merge(existing_content, new_content)
-
-    if verbose:
-        console.print(f"[cyan]Merged JSON file:[/cyan] {existing_path.name}")
-
-    return merged
-
-def download_template_from_github(ai_assistant: str, download_dir: Path, *, script_type: str = "sh", verbose: bool = True, show_progress: bool = True, client: httpx.Client = None, debug: bool = False, github_token: str = None) -> Tuple[Path, dict]:
-    repo_owner = "github"
-    repo_name = "spec-kit"
-    if client is None:
-        client = httpx.Client(verify=ssl_context)
-
-    if verbose:
-        console.print("[cyan]Fetching latest release information...[/cyan]")
-    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
-
-    try:
-        response = client.get(
-            api_url,
-            timeout=30,
-            follow_redirects=True,
-            headers=_github_auth_headers(github_token),
-        )
-        status = response.status_code
-        if status != 200:
-            # Format detailed error message with rate-limit info
-            error_msg = _format_rate_limit_error(status, response.headers, api_url)
-            if debug:
-                error_msg += f"\n\n[dim]Response body (truncated 500):[/dim]\n{response.text[:500]}"
-            raise RuntimeError(error_msg)
-        try:
-            release_data = response.json()
-        except ValueError as je:
-            raise RuntimeError(f"Failed to parse release JSON: {je}\nRaw (truncated 400): {response.text[:400]}")
-    except Exception as e:
-        console.print("[red]Error fetching release information[/red]")
-        console.print(Panel(str(e), title="Fetch Error", border_style="red"))
+    except (ValueError, OSError) as exc:
+        console.print(f"[red]Error:[/red] Failed to install shared infrastructure: {exc}")
         raise typer.Exit(1)
-
-    assets = release_data.get("assets", [])
-    pattern = f"spec-kit-template-{ai_assistant}-{script_type}"
-    matching_assets = [
-        asset for asset in assets
-        if pattern in asset["name"] and asset["name"].endswith(".zip")
-    ]
-
-    asset = matching_assets[0] if matching_assets else None
-
-    if asset is None:
-        console.print(f"[red]No matching release asset found[/red] for [bold]{ai_assistant}[/bold] (expected pattern: [bold]{pattern}[/bold])")
-        asset_names = [a.get('name', '?') for a in assets]
-        console.print(Panel("\n".join(asset_names) or "(no assets)", title="Available Assets", border_style="yellow"))
-        raise typer.Exit(1)
-
-    download_url = asset["browser_download_url"]
-    filename = asset["name"]
-    file_size = asset["size"]
-
-    if verbose:
-        console.print(f"[cyan]Found template:[/cyan] {filename}")
-        console.print(f"[cyan]Size:[/cyan] {file_size:,} bytes")
-        console.print(f"[cyan]Release:[/cyan] {release_data['tag_name']}")
-
-    zip_path = download_dir / filename
-    if verbose:
-        console.print("[cyan]Downloading template...[/cyan]")
-
-    try:
-        with client.stream(
-            "GET",
-            download_url,
-            timeout=60,
-            follow_redirects=True,
-            headers=_github_auth_headers(github_token),
-        ) as response:
-            if response.status_code != 200:
-                # Handle rate-limiting on download as well
-                error_msg = _format_rate_limit_error(response.status_code, response.headers, download_url)
-                if debug:
-                    error_msg += f"\n\n[dim]Response body (truncated 400):[/dim]\n{response.text[:400]}"
-                raise RuntimeError(error_msg)
-            total_size = int(response.headers.get('content-length', 0))
-            with open(zip_path, 'wb') as f:
-                if total_size == 0:
-                    for chunk in response.iter_bytes(chunk_size=8192):
-                        f.write(chunk)
-                else:
-                    if show_progress:
-                        with Progress(
-                            SpinnerColumn(),
-                            TextColumn("[progress.description]{task.description}"),
-                            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-                            console=console,
-                        ) as progress:
-                            task = progress.add_task("Downloading...", total=total_size)
-                            downloaded = 0
-                            for chunk in response.iter_bytes(chunk_size=8192):
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                                progress.update(task, completed=downloaded)
-                    else:
-                        for chunk in response.iter_bytes(chunk_size=8192):
-                            f.write(chunk)
-    except Exception as e:
-        console.print("[red]Error downloading template[/red]")
-        detail = str(e)
-        if zip_path.exists():
-            zip_path.unlink()
-        console.print(Panel(detail, title="Download Error", border_style="red"))
-        raise typer.Exit(1)
-    if verbose:
-        console.print(f"Downloaded: {filename}")
-    metadata = {
-        "filename": filename,
-        "size": file_size,
-        "release": release_data["tag_name"],
-        "asset_url": download_url
-    }
-    return zip_path, metadata
-
-def download_and_extract_template(project_path: Path, ai_assistant: str, script_type: str, is_current_dir: bool = False, *, verbose: bool = True, tracker: StepTracker | None = None, client: httpx.Client = None, debug: bool = False, github_token: str = None) -> Path:
-    """Download the latest release and extract it to create a new project.
-    Returns project_path. Uses tracker if provided (with keys: fetch, download, extract, cleanup)
-    """
-    current_dir = Path.cwd()
-
-    if tracker:
-        tracker.start("fetch", "contacting GitHub API")
-    try:
-        zip_path, meta = download_template_from_github(
-            ai_assistant,
-            current_dir,
-            script_type=script_type,
-            verbose=verbose and tracker is None,
-            show_progress=(tracker is None),
-            client=client,
-            debug=debug,
-            github_token=github_token
-        )
-        if tracker:
-            tracker.complete("fetch", f"release {meta['release']} ({meta['size']:,} bytes)")
-            tracker.add("download", "Download template")
-            tracker.complete("download", meta['filename'])
-    except Exception as e:
-        if tracker:
-            tracker.error("fetch", str(e))
-        else:
-            if verbose:
-                console.print(f"[red]Error downloading template:[/red] {e}")
-        raise
-
-    if tracker:
-        tracker.add("extract", "Extract template")
-        tracker.start("extract")
-    elif verbose:
-        console.print("Extracting template...")
-
-    try:
-        if not is_current_dir:
-            project_path.mkdir(parents=True)
-
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_contents = zip_ref.namelist()
-            if tracker:
-                tracker.start("zip-list")
-                tracker.complete("zip-list", f"{len(zip_contents)} entries")
-            elif verbose:
-                console.print(f"[cyan]ZIP contains {len(zip_contents)} items[/cyan]")
-
-            if is_current_dir:
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_path = Path(temp_dir)
-                    zip_ref.extractall(temp_path)
-
-                    extracted_items = list(temp_path.iterdir())
-                    if tracker:
-                        tracker.start("extracted-summary")
-                        tracker.complete("extracted-summary", f"temp {len(extracted_items)} items")
-                    elif verbose:
-                        console.print(f"[cyan]Extracted {len(extracted_items)} items to temp location[/cyan]")
-
-                    source_dir = temp_path
-                    if len(extracted_items) == 1 and extracted_items[0].is_dir():
-                        source_dir = extracted_items[0]
-                        if tracker:
-                            tracker.add("flatten", "Flatten nested directory")
-                            tracker.complete("flatten")
-                        elif verbose:
-                            console.print("[cyan]Found nested directory structure[/cyan]")
-
-                    for item in source_dir.iterdir():
-                        dest_path = project_path / item.name
-                        if item.is_dir():
-                            if dest_path.exists():
-                                if verbose and not tracker:
-                                    console.print(f"[yellow]Merging directory:[/yellow] {item.name}")
-                                for sub_item in item.rglob('*'):
-                                    if sub_item.is_file():
-                                        rel_path = sub_item.relative_to(item)
-                                        dest_file = dest_path / rel_path
-                                        dest_file.parent.mkdir(parents=True, exist_ok=True)
-                                        # Special handling for .vscode/settings.json - merge instead of overwrite
-                                        if dest_file.name == "settings.json" and dest_file.parent.name == ".vscode":
-                                            handle_vscode_settings(sub_item, dest_file, rel_path, verbose, tracker)
-                                        else:
-                                            shutil.copy2(sub_item, dest_file)
-                            else:
-                                shutil.copytree(item, dest_path)
-                        else:
-                            if dest_path.exists() and verbose and not tracker:
-                                console.print(f"[yellow]Overwriting file:[/yellow] {item.name}")
-                            shutil.copy2(item, dest_path)
-                    if verbose and not tracker:
-                        console.print("[cyan]Template files merged into current directory[/cyan]")
-            else:
-                zip_ref.extractall(project_path)
-
-                extracted_items = list(project_path.iterdir())
-                if tracker:
-                    tracker.start("extracted-summary")
-                    tracker.complete("extracted-summary", f"{len(extracted_items)} top-level items")
-                elif verbose:
-                    console.print(f"[cyan]Extracted {len(extracted_items)} items to {project_path}:[/cyan]")
-                    for item in extracted_items:
-                        console.print(f"  - {item.name} ({'dir' if item.is_dir() else 'file'})")
-
-                if len(extracted_items) == 1 and extracted_items[0].is_dir():
-                    nested_dir = extracted_items[0]
-                    temp_move_dir = project_path.parent / f"{project_path.name}_temp"
-
-                    shutil.move(str(nested_dir), str(temp_move_dir))
-
-                    project_path.rmdir()
-
-                    shutil.move(str(temp_move_dir), str(project_path))
-                    if tracker:
-                        tracker.add("flatten", "Flatten nested directory")
-                        tracker.complete("flatten")
-                    elif verbose:
-                        console.print("[cyan]Flattened nested directory structure[/cyan]")
-
-    except Exception as e:
-        if tracker:
-            tracker.error("extract", str(e))
-        else:
-            if verbose:
-                console.print(f"[red]Error extracting template:[/red] {e}")
-                if debug:
-                    console.print(Panel(str(e), title="Extraction Error", border_style="red"))
-
-        if not is_current_dir and project_path.exists():
-            shutil.rmtree(project_path)
-        raise typer.Exit(1)
-    else:
-        if tracker:
-            tracker.complete("extract")
-    finally:
-        if tracker:
-            tracker.add("cleanup", "Remove temporary archive")
-
-        if zip_path.exists():
-            zip_path.unlink()
-            if tracker:
-                tracker.complete("cleanup")
-            elif verbose:
-                console.print(f"Cleaned up: {zip_path.name}")
-
-    return project_path
 
 
 def ensure_executable_scripts(project_path: Path, tracker: StepTracker | None = None) -> None:
-    """Ensure POSIX .sh scripts under .specify/scripts (recursively) have execute bits (no-op on Windows)."""
+    """Ensure POSIX .sh scripts under .specify/scripts and .specify/extensions (recursively) have execute bits (no-op on Windows)."""
     if os.name == "nt":
         return  # Windows: skip silently
-    scripts_root = project_path / ".specify" / "scripts"
-    if not scripts_root.is_dir():
-        return
+    scan_roots = [
+        project_path / ".specify" / "scripts",
+        project_path / ".specify" / "extensions",
+    ]
     failures: list[str] = []
     updated = 0
-    for script in scripts_root.rglob("*.sh"):
-        try:
-            if script.is_symlink() or not script.is_file():
-                continue
+    for scripts_root in scan_roots:
+        if not scripts_root.is_dir():
+            continue
+        for script in scripts_root.rglob("*.sh"):
             try:
-                with script.open("rb") as f:
-                    if f.read(2) != b"#!":
-                        continue
-            except Exception:
-                continue
-            st = script.stat()
-            mode = st.st_mode
-            if mode & 0o111:
-                continue
-            new_mode = mode
-            if mode & 0o400:
-                new_mode |= 0o100
-            if mode & 0o040:
-                new_mode |= 0o010
-            if mode & 0o004:
-                new_mode |= 0o001
-            if not (new_mode & 0o100):
-                new_mode |= 0o100
-            os.chmod(script, new_mode)
-            updated += 1
-        except Exception as e:
-            failures.append(f"{script.relative_to(scripts_root)}: {e}")
+                if script.is_symlink() or not script.is_file():
+                    continue
+                try:
+                    with script.open("rb") as f:
+                        if f.read(2) != b"#!":
+                            continue
+                except Exception:
+                    continue
+                st = script.stat()
+                mode = st.st_mode
+                if mode & 0o111:
+                    continue
+                new_mode = mode
+                if mode & 0o400:
+                    new_mode |= 0o100
+                if mode & 0o040:
+                    new_mode |= 0o010
+                if mode & 0o004:
+                    new_mode |= 0o001
+                if not (new_mode & 0o100):
+                    new_mode |= 0o100
+                os.chmod(script, new_mode)
+                updated += 1
+            except Exception as e:
+                failures.append(f"{_display_project_path(project_path, script)}: {e}")
     if tracker:
         detail = f"{updated} updated" + (f", {len(failures)} failed" if failures else "")
         tracker.add("chmod", "Set script permissions recursively")
@@ -1067,224 +384,92 @@ def ensure_constitution_from_template(project_path: Path, tracker: StepTracker |
         else:
             console.print(f"[yellow]Warning: Could not initialize constitution: {e}[/yellow]")
 
-# Agent-specific skill directory overrides for agents whose skills directory
-# doesn't follow the standard <agent_folder>/skills/ pattern
-AGENT_SKILLS_DIR_OVERRIDES = {
-    "codex": ".agents/skills",  # Codex agent layout override
-}
 
-# Default skills directory for agents not in AGENT_CONFIG
-DEFAULT_SKILLS_DIR = ".agents/skills"
+INIT_OPTIONS_FILE = ".specify/init-options.json"
 
-# Enhanced descriptions for each spec-kit command skill
-SKILL_DESCRIPTIONS = {
-    "specify": "Create or update feature specifications from natural language descriptions. Use when starting new features or refining requirements. Generates spec.md with user stories, functional requirements, and acceptance criteria following spec-driven development methodology.",
-    "plan": "Generate technical implementation plans from feature specifications. Use after creating a spec to define architecture, tech stack, and implementation phases. Creates plan.md with detailed technical design.",
-    "tasks": "Break down implementation plans into actionable task lists. Use after planning to create a structured task breakdown. Generates tasks.md with ordered, dependency-aware tasks.",
-    "implement": "Execute all tasks from the task breakdown to build the feature. Use after task generation to systematically implement the planned solution following TDD approach where applicable.",
-    "analyze": "Perform cross-artifact consistency analysis across spec.md, plan.md, and tasks.md. Use after task generation to identify gaps, duplications, and inconsistencies before implementation.",
-    "clarify": "Structured clarification workflow for underspecified requirements. Use before planning to resolve ambiguities through coverage-based questioning. Records answers in spec clarifications section.",
-    "constitution": "Create or update project governing principles and development guidelines. Use at project start to establish code quality, testing standards, and architectural constraints that guide all development.",
-    "checklist": "Generate custom quality checklists for validating requirements completeness and clarity. Use to create unit tests for English that ensure spec quality before implementation.",
-    "taskstoissues": "Convert tasks from tasks.md into GitHub issues. Use after task breakdown to track work items in GitHub project management.",
-}
+
+def save_init_options(project_path: Path, options: dict[str, Any]) -> None:
+    """Persist the CLI options used during ``specify init``.
+
+    Writes a small JSON file to ``.specify/init-options.json`` so that
+    later operations (e.g. preset install) can adapt their behaviour
+    without scanning the filesystem.
+    """
+    dest = project_path / INIT_OPTIONS_FILE
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(options, indent=2, sort_keys=True))
+
+
+def load_init_options(project_path: Path) -> dict[str, Any]:
+    """Load the init options previously saved by ``specify init``.
+
+    Returns an empty dict if the file does not exist or cannot be parsed.
+    """
+    path = project_path / INIT_OPTIONS_FILE
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
 def _get_skills_dir(project_path: Path, selected_ai: str) -> Path:
-    """Resolve the agent-specific skills directory for the given AI assistant.
+    """Resolve the agent-specific skills directory.
 
-    Uses ``AGENT_SKILLS_DIR_OVERRIDES`` first, then falls back to
-    ``AGENT_CONFIG[agent]["folder"] + "skills"``, and finally to
-    ``DEFAULT_SKILLS_DIR``.
+    Returns ``project_path / <agent_folder> / "skills"``, falling back
+    to ``project_path / ".agents/skills"`` for unknown agents.
     """
-    if selected_ai in AGENT_SKILLS_DIR_OVERRIDES:
-        return project_path / AGENT_SKILLS_DIR_OVERRIDES[selected_ai]
-
     agent_config = AGENT_CONFIG.get(selected_ai, {})
     agent_folder = agent_config.get("folder", "")
     if agent_folder:
         return project_path / agent_folder.rstrip("/") / "skills"
-
-    return project_path / DEFAULT_SKILLS_DIR
-
-
-def install_ai_skills(project_path: Path, selected_ai: str, tracker: StepTracker | None = None) -> bool:
-    """Install Prompt.MD files from templates/commands/ as agent skills.
-
-    Skills are written to the agent-specific skills directory following the
-    `agentskills.io <https://agentskills.io/specification>`_ specification.
-    Installation is additive — existing files are never removed and prompt
-    command files in the agent's commands directory are left untouched.
-
-    Args:
-        project_path: Target project directory.
-        selected_ai: AI assistant key from ``AGENT_CONFIG``.
-        tracker: Optional progress tracker.
-
-    Returns:
-        ``True`` if at least one skill was installed or all skills were
-        already present (idempotent re-run), ``False`` otherwise.
-    """
-    # Locate command templates in the agent's extracted commands directory.
-    # download_and_extract_template() already placed the .md files here.
-    agent_config = AGENT_CONFIG.get(selected_ai, {})
-    agent_folder = agent_config.get("folder", "")
-    commands_subdir = agent_config.get("commands_subdir", "commands")
-    if agent_folder:
-        templates_dir = project_path / agent_folder.rstrip("/") / commands_subdir
-    else:
-        templates_dir = project_path / commands_subdir
-
-    if not templates_dir.exists() or not any(templates_dir.glob("*.md")):
-        # Fallback: try the repo-relative path (for running from source checkout)
-        # This also covers agents whose extracted commands are in a different
-        # format (e.g. gemini/tabnine use .toml, not .md).
-        script_dir = Path(__file__).parent.parent.parent  # up from src/specify_cli/
-        fallback_dir = script_dir / "templates" / "commands"
-        if fallback_dir.exists() and any(fallback_dir.glob("*.md")):
-            templates_dir = fallback_dir
-
-    if not templates_dir.exists() or not any(templates_dir.glob("*.md")):
-        if tracker:
-            tracker.error("ai-skills", "command templates not found")
-        else:
-            console.print("[yellow]Warning: command templates not found, skipping skills installation[/yellow]")
-        return False
-
-    command_files = sorted(templates_dir.glob("*.md"))
-    if not command_files:
-        if tracker:
-            tracker.skip("ai-skills", "no command templates found")
-        else:
-            console.print("[yellow]No command templates found to install[/yellow]")
-        return False
-
-    # Resolve the correct skills directory for this agent
-    skills_dir = _get_skills_dir(project_path, selected_ai)
-    skills_dir.mkdir(parents=True, exist_ok=True)
-
-    if tracker:
-        tracker.start("ai-skills")
-
-    installed_count = 0
-    skipped_count = 0
-    for command_file in command_files:
-        try:
-            content = command_file.read_text(encoding="utf-8")
-
-            # Parse YAML frontmatter
-            if content.startswith("---"):
-                parts = content.split("---", 2)
-                if len(parts) >= 3:
-                    frontmatter = yaml.safe_load(parts[1])
-                    if not isinstance(frontmatter, dict):
-                        frontmatter = {}
-                    body = parts[2].strip()
-                else:
-                    # File starts with --- but has no closing ---
-                    console.print(f"[yellow]Warning: {command_file.name} has malformed frontmatter (no closing ---), treating as plain content[/yellow]")
-                    frontmatter = {}
-                    body = content
-            else:
-                frontmatter = {}
-                body = content
-
-            command_name = command_file.stem
-            # Normalize: extracted commands may be named "speckit.<cmd>.md";
-            # strip the "speckit." prefix so skill names stay clean and
-            # SKILL_DESCRIPTIONS lookups work.
-            if command_name.startswith("speckit."):
-                command_name = command_name[len("speckit."):]
-            # Kimi CLI discovers skills by directory name and invokes them as
-            # /skill:<name> — use dot separator to match packaging convention.
-            if selected_ai == "kimi":
-                skill_name = f"speckit.{command_name}"
-            else:
-                skill_name = f"speckit-{command_name}"
-
-            # Create skill directory (additive — never removes existing content)
-            skill_dir = skills_dir / skill_name
-            skill_dir.mkdir(parents=True, exist_ok=True)
-
-            # Select the best description available
-            original_desc = frontmatter.get("description", "")
-            enhanced_desc = SKILL_DESCRIPTIONS.get(command_name, original_desc or f"Spec-kit workflow command: {command_name}")
-
-            # Build SKILL.md following agentskills.io spec
-            # Use yaml.safe_dump to safely serialise the frontmatter and
-            # avoid YAML injection from descriptions containing colons,
-            # quotes, or newlines.
-            # Normalize source filename for metadata — strip speckit. prefix
-            # so it matches the canonical templates/commands/<cmd>.md path.
-            source_name = command_file.name
-            if source_name.startswith("speckit."):
-                source_name = source_name[len("speckit."):]
-
-            frontmatter_data = {
-                "name": skill_name,
-                "description": enhanced_desc,
-                "compatibility": "Requires spec-kit project structure with .specify/ directory",
-                "metadata": {
-                    "author": "github-spec-kit",
-                    "source": f"templates/commands/{source_name}",
-                },
-            }
-            frontmatter_text = yaml.safe_dump(frontmatter_data, sort_keys=False).strip()
-            skill_content = (
-                f"---\n"
-                f"{frontmatter_text}\n"
-                f"---\n\n"
-                f"# Speckit {command_name.title()} Skill\n\n"
-                f"{body}\n"
-            )
-
-            skill_file = skill_dir / "SKILL.md"
-            if skill_file.exists():
-                # Do not overwrite user-customized skills on re-runs
-                skipped_count += 1
-                continue
-            skill_file.write_text(skill_content, encoding="utf-8")
-            installed_count += 1
-
-        except Exception as e:
-            console.print(f"[yellow]Warning: Failed to install skill {command_file.stem}: {e}[/yellow]")
-            continue
-
-    if tracker:
-        if installed_count > 0 and skipped_count > 0:
-            tracker.complete("ai-skills", f"{installed_count} new + {skipped_count} existing skills in {skills_dir.relative_to(project_path)}")
-        elif installed_count > 0:
-            tracker.complete("ai-skills", f"{installed_count} skills → {skills_dir.relative_to(project_path)}")
-        elif skipped_count > 0:
-            tracker.complete("ai-skills", f"{skipped_count} skills already present")
-        else:
-            tracker.error("ai-skills", "no skills installed")
-    else:
-        if installed_count > 0:
-            console.print(f"[green]✓[/green] Installed {installed_count} agent skills to {skills_dir.relative_to(project_path)}/")
-        elif skipped_count > 0:
-            console.print(f"[green]✓[/green] {skipped_count} agent skills already present in {skills_dir.relative_to(project_path)}/")
-        else:
-            console.print("[yellow]No skills were installed[/yellow]")
-
-    return installed_count > 0 or skipped_count > 0
+    return project_path / ".agents" / "skills"
 
 
-def _handle_agy_deprecation(console: Console) -> None:
-    """
-    Print the deprecation error for the Antigravity (agy) agent and exit.
+def _cli_error_detail(exc: BaseException) -> str:
+    """Return a compact one-line exception detail for CLI output."""
+    detail = str(exc).replace("\n", " ").strip()
+    return detail or exc.__class__.__name__
 
-    Context for future AI reviewers (e.g., GitHub Copilot):
-    - Prior to Antigravity v1.20.5, users could rely on explicit agent command definitions generated by this tool.
-    - v1.20.5 removed this "command support" in favor of "Agent Skills".
-    - `specify_cli` handles this by throwing a fail-fast deprecation error if `--ai agy` is 
-      invoked without the accompanying `--ai-skills` flag. Users are instructed to add 
-      the skills flag to generate agent skills templates instead.
-    """
-    console.print("\n[red]Error:[/red] Explicit command support was deprecated in Antigravity version 1.20.5.")
-    console.print("Please use [cyan]--ai-skills[/cyan] when initializing to install templates as agent skills instead.")
-    console.print("[yellow]Usage:[/yellow] specify init <project> --ai agy --ai-skills")
-    raise typer.Exit(1)
+
+def _cli_phase_label(phase: str, target_kind: str, target: str | None = None) -> str:
+    """Format a stable operation label for user-visible diagnostics."""
+    label = f"{phase} {target_kind}".strip()
+    if target:
+        label = f"{label} '{target}'"
+    return label
+
+
+def _print_cli_warning(
+    phase: str,
+    target_kind: str,
+    target: str | None,
+    exc: BaseException,
+    *,
+    continuing: str | None = None,
+) -> None:
+    """Print a warning that names the failed CLI phase and target."""
+    label = _cli_phase_label(phase, target_kind, target)
+    console.print(f"[yellow]Warning:[/yellow] Failed to {label}: {_cli_error_detail(exc)}")
+    if continuing:
+        console.print(f"[dim]{continuing}[/dim]")
+
+
+# Constants kept for backward compatibility with presets and extensions.
+DEFAULT_SKILLS_DIR = ".agents/skills"
+SKILL_DESCRIPTIONS = {
+    "specify": "Create or update feature specifications from natural language descriptions.",
+    "plan": "Generate technical implementation plans from feature specifications.",
+    "tasks": "Break down implementation plans into actionable task lists.",
+    "implement": "Execute all tasks from the task breakdown to build the feature.",
+    "analyze": "Perform cross-artifact consistency analysis across spec.md, plan.md, and tasks.md.",
+    "clarify": "Structured clarification workflow for underspecified requirements.",
+    "constitution": "Create or update project governing principles and development guidelines.",
+    "checklist": "Generate custom quality checklists for validating requirements completeness and clarity.",
+    "taskstoissues": "Convert tasks from tasks.md into GitHub issues.",
+}
+
 
 @app.command()
 def init(
@@ -1292,62 +477,133 @@ def init(
     ai_assistant: str = typer.Option(None, "--ai", help=AI_ASSISTANT_HELP),
     ai_commands_dir: str = typer.Option(None, "--ai-commands-dir", help="Directory for agent command files (required with --ai generic, e.g. .myagent/commands/)"),
     script_type: str = typer.Option(None, "--script", help="Script type to use: sh or ps"),
-    ignore_agent_tools: bool = typer.Option(False, "--ignore-agent-tools", help="Skip checks for AI agent tools like Claude Code"),
+    ignore_agent_tools: bool = typer.Option(False, "--ignore-agent-tools", help="Skip checks for coding agent tools like Claude Code"),
     no_git: bool = typer.Option(False, "--no-git", help="Skip git repository initialization"),
     here: bool = typer.Option(False, "--here", help="Initialize project in the current directory instead of creating a new one"),
     force: bool = typer.Option(False, "--force", help="Force merge/overwrite when using --here (skip confirmation)"),
-    skip_tls: bool = typer.Option(False, "--skip-tls", help="Skip SSL/TLS verification (not recommended)"),
-    debug: bool = typer.Option(False, "--debug", help="Show verbose diagnostic output for network and extraction failures"),
-    github_token: str = typer.Option(None, "--github-token", help="GitHub token to use for API requests (or set GH_TOKEN or GITHUB_TOKEN environment variable)"),
+    skip_tls: bool = typer.Option(False, "--skip-tls", help="Deprecated (no-op). Previously: skip SSL/TLS verification.", hidden=True),
+    debug: bool = typer.Option(False, "--debug", help="Deprecated (no-op). Previously: show verbose diagnostic output.", hidden=True),
+    github_token: str = typer.Option(None, "--github-token", help="Deprecated (no-op). Previously: GitHub token for API requests.", hidden=True),
     ai_skills: bool = typer.Option(False, "--ai-skills", help="Install Prompt.MD templates as agent skills (requires --ai)"),
+    offline: bool = typer.Option(False, "--offline", help="Deprecated (no-op). All scaffolding now uses bundled assets.", hidden=True),
+    preset: str = typer.Option(None, "--preset", help="Install a preset during initialization (by preset ID)"),
+    branch_numbering: str = typer.Option(None, "--branch-numbering", help="Branch numbering strategy: 'sequential' (001, 002, …, 1000, … — expands past 999 automatically) or 'timestamp' (YYYYMMDD-HHMMSS)"),
+    integration: str = typer.Option(None, "--integration", help="Use the new integration system (e.g. --integration copilot). Mutually exclusive with --ai."),
+    integration_options: str = typer.Option(None, "--integration-options", help='Options for the integration (e.g. --integration-options="--commands-dir .myagent/cmds")'),
 ):
     """
-    Initialize a new Specify project from the latest template.
-    
+    Initialize a new Specify project.
+
+    By default, project files are downloaded from the latest GitHub release.
+    Use --offline to scaffold from assets bundled inside the specify-cli
+    package instead (no internet access required, ideal for air-gapped or
+    enterprise environments).
+
+    NOTE: Starting with v0.6.0, bundled assets will be used by default and
+    the --offline flag will be removed. The GitHub download path will be
+    retired because bundled assets eliminate the need for network access,
+    avoid proxy/firewall issues, and guarantee that templates always match
+    the installed CLI version.
+
     This command will:
     1. Check that required tools are installed (git is optional)
-    2. Let you choose your AI assistant
-    3. Download the appropriate template from GitHub
-    4. Extract the template to a new project directory or current directory
-    5. Initialize a fresh git repository (if not --no-git and no existing repo)
-    6. Optionally set up AI assistant commands
-    
+    2. Let you choose your coding agent integration, or default to Copilot
+       in non-interactive sessions
+    3. Download template from GitHub (or use bundled assets with --offline)
+    4. Initialize a fresh git repository (if not --no-git and no existing repo)
+    5. Optionally set up coding agent integration commands
+
     Examples:
         specify init my-project
-        specify init my-project --ai claude
-        specify init my-project --ai copilot --no-git
+        specify init my-project --integration claude
+        specify init my-project --integration copilot --no-git
         specify init --ignore-agent-tools my-project
-        specify init . --ai claude         # Initialize in current directory
-        specify init .                     # Initialize in current directory (interactive AI selection)
-        specify init --here --ai claude    # Alternative syntax for current directory
-        specify init --here --ai codex
-        specify init --here --ai codebuddy
-        specify init --here --ai vibe      # Initialize with Mistral Vibe support
+        specify init . --integration claude         # Initialize in current directory
+        specify init .                     # Initialize in current directory (interactive integration selection)
+        specify init --here --integration claude    # Alternative syntax for current directory
+        specify init --here --integration codex --integration-options="--skills"
+        specify init --here --integration codebuddy
+        specify init --here --integration vibe      # Initialize with Mistral Vibe support
         specify init --here
         specify init --here --force  # Skip confirmation when current directory not empty
-        specify init my-project --ai claude --ai-skills   # Install agent skills
-        specify init --here --ai gemini --ai-skills
-        specify init my-project --ai generic --ai-commands-dir .myagent/commands/  # Unsupported agent
+        specify init my-project --integration claude   # Claude installs skills by default
+        specify init --here --integration gemini
+        specify init my-project --integration generic --integration-options="--commands-dir .myagent/commands/"  # Bring your own agent; requires --commands-dir
+        specify init my-project --integration claude --preset healthcare-compliance  # With preset
     """
 
     show_banner()
+    ai_deprecation_warning: str | None = None
 
     # Detect when option values are likely misinterpreted flags (parameter ordering issue)
     if ai_assistant and ai_assistant.startswith("--"):
         console.print(f"[red]Error:[/red] Invalid value for --ai: '{ai_assistant}'")
         console.print("[yellow]Hint:[/yellow] Did you forget to provide a value for --ai?")
-        console.print("[yellow]Example:[/yellow] specify init --ai claude --here")
+        console.print("[yellow]Example:[/yellow] specify init --integration claude --here")
         console.print(f"[yellow]Available agents:[/yellow] {', '.join(AGENT_CONFIG.keys())}")
         raise typer.Exit(1)
-    
+
     if ai_commands_dir and ai_commands_dir.startswith("--"):
         console.print(f"[red]Error:[/red] Invalid value for --ai-commands-dir: '{ai_commands_dir}'")
         console.print("[yellow]Hint:[/yellow] Did you forget to provide a value for --ai-commands-dir?")
-        console.print("[yellow]Example:[/yellow] specify init --ai generic --ai-commands-dir .myagent/commands/")
+        console.print("[yellow]Example:[/yellow] specify init --integration generic --integration-options=\"--commands-dir .myagent/commands/\"")
         raise typer.Exit(1)
 
     if ai_assistant:
         ai_assistant = AI_ASSISTANT_ALIASES.get(ai_assistant, ai_assistant)
+
+    # --integration and --ai are mutually exclusive
+    if integration and ai_assistant:
+        console.print("[red]Error:[/red] --integration and --ai are mutually exclusive")
+        raise typer.Exit(1)
+
+    # Resolve the integration — either from --integration or --ai
+    from .integrations import INTEGRATION_REGISTRY, get_integration
+    if integration:
+        resolved_integration = get_integration(integration)
+        if not resolved_integration:
+            console.print(f"[red]Error:[/red] Unknown integration: '{integration}'")
+            available = ", ".join(sorted(INTEGRATION_REGISTRY))
+            console.print(f"[yellow]Available integrations:[/yellow] {available}")
+            raise typer.Exit(1)
+        ai_assistant = integration
+    elif ai_assistant:
+        resolved_integration = get_integration(ai_assistant)
+        if not resolved_integration:
+            console.print(f"[red]Error:[/red] Unknown agent '{ai_assistant}'. Choose from: {', '.join(sorted(INTEGRATION_REGISTRY))}")
+            raise typer.Exit(1)
+        ai_deprecation_warning = _build_ai_deprecation_warning(
+            resolved_integration.key,
+            ai_commands_dir=ai_commands_dir,
+        )
+
+    # Deprecation warnings for --ai-skills and --ai-commands-dir (only when
+    # an integration has been resolved from --ai or --integration)
+    if ai_assistant or integration:
+        if ai_skills:
+            from .integrations.base import SkillsIntegration as _SkillsCheck
+            if isinstance(resolved_integration, _SkillsCheck):
+                console.print(
+                    "[dim]Note: --ai-skills is not needed; "
+                    "skills are the default for this integration.[/dim]"
+                )
+            else:
+                console.print(
+                    "[dim]Note: --ai-skills has no effect with "
+                    f"{resolved_integration.key}; this integration uses commands, not skills.[/dim]"
+                )
+        if ai_commands_dir and resolved_integration.key != "generic":
+            console.print(
+                "[dim]Note: --ai-commands-dir is deprecated; "
+                'use [bold]--integration generic --integration-options="--commands-dir <dir>"[/bold] instead.[/dim]'
+            )
+
+    if no_git:
+        console.print(
+            "[yellow]⚠️  --no-git is deprecated and will be removed in v0.10.0.[/yellow]\n"
+            "[yellow]The git extension will no longer be enabled by default "
+            "— use the [bold]specify extension[/bold] commands to install or enable the git extension if needed.[/yellow]"
+        )
 
     if project_name == ".":
         here = True
@@ -1366,9 +622,16 @@ def init(
         console.print("[yellow]Usage:[/yellow] specify init <project> --ai <agent> --ai-skills")
         raise typer.Exit(1)
 
+    BRANCH_NUMBERING_CHOICES = {"sequential", "timestamp"}
+    if branch_numbering and branch_numbering not in BRANCH_NUMBERING_CHOICES:
+        console.print(f"[red]Error:[/red] Invalid --branch-numbering value '{branch_numbering}'. Choose from: {', '.join(sorted(BRANCH_NUMBERING_CHOICES))}")
+        raise typer.Exit(1)
+
+    dir_existed_before = False
     if here:
         project_name = Path.cwd().name
         project_path = Path.cwd()
+        dir_existed_before = True
 
         existing_items = list(project_path.iterdir())
         if existing_items:
@@ -1383,60 +646,65 @@ def init(
                     raise typer.Exit(0)
     else:
         project_path = Path(project_name).resolve()
+        dir_existed_before = project_path.exists()
         if project_path.exists():
-            error_panel = Panel(
-                f"Directory '[cyan]{project_name}[/cyan]' already exists\n"
-                "Please choose a different project name or remove the existing directory.",
-                title="[red]Directory Conflict[/red]",
-                border_style="red",
-                padding=(1, 2)
-            )
-            console.print()
-            console.print(error_panel)
-            raise typer.Exit(1)
+            if not project_path.is_dir():
+                console.print(f"[red]Error:[/red] '{project_name}' exists but is not a directory.")
+                raise typer.Exit(1)
+            existing_items = list(project_path.iterdir())
+            if force:
+                if existing_items:
+                    console.print(f"[yellow]Warning:[/yellow] Directory '{project_name}' is not empty ({len(existing_items)} items)")
+                    console.print("[yellow]Template files will be merged with existing content and may overwrite existing files[/yellow]")
+                console.print(f"[cyan]--force supplied: merging into existing directory '[cyan]{project_name}[/cyan]'[/cyan]")
+            else:
+                error_panel = Panel(
+                    f"Directory already exists: '[cyan]{project_name}[/cyan]'\n"
+                    "Please choose a different project name or remove the existing directory.\n"
+                    "Use [bold]--force[/bold] to merge into the existing directory.",
+                    title="[red]Directory Conflict[/red]",
+                    border_style="red",
+                    padding=(1, 2)
+                )
+                console.print()
+                console.print(error_panel)
+                raise typer.Exit(1)
 
     if ai_assistant:
         if ai_assistant not in AGENT_CONFIG:
             console.print(f"[red]Error:[/red] Invalid AI assistant '{ai_assistant}'. Choose from: {', '.join(AGENT_CONFIG.keys())}")
             raise typer.Exit(1)
         selected_ai = ai_assistant
+    elif not _stdin_is_interactive():
+        console.print(
+            f"[dim]Non-interactive session detected: defaulting to '{DEFAULT_INIT_INTEGRATION}'. "
+            "Use --integration to choose a different agent.[/dim]"
+        )
+        selected_ai = DEFAULT_INIT_INTEGRATION
     else:
         # Create options dict for selection (agent_key: display_name)
         ai_choices = {key: config["name"] for key, config in AGENT_CONFIG.items()}
         selected_ai = select_with_arrows(
-            ai_choices, 
-            "Choose your AI assistant:", 
-            "copilot"
+            ai_choices,
+            "Choose your coding agent integration:",
+            DEFAULT_INIT_INTEGRATION,
         )
 
-    # [DEPRECATION NOTICE: Antigravity (agy)]
-    # As of Antigravity v1.20.5, traditional CLI "command" support was fully removed
-    # in favor of "Agent Skills" (SKILL.md files under <agent_folder>/skills/<skill_name>/).
-    # Because 'specify_cli' historically populated .agent/commands/, we now must explicitly
-    # enforce the `--ai-skills` flag for `agy` to ensure valid template generation.
-    if selected_ai == "agy" and not ai_skills:
-        # If agy was selected interactively (no --ai provided), automatically enable
-        # ai_skills so the agent remains usable without requiring an extra flag.
-        # Preserve deprecation behavior only for explicit '--ai agy' without skills.
-        if ai_assistant:
-            _handle_agy_deprecation(console)
-        else:
-            ai_skills = True
-            console.print(
-                "\n[yellow]Note:[/yellow] 'agy' was selected interactively; "
-                "enabling [cyan]--ai-skills[/cyan] automatically for compatibility "
-                "(explicit .agent/commands usage is deprecated)."
-            )
-
-    # Validate --ai-commands-dir usage
-    if selected_ai == "generic":
-        if not ai_commands_dir:
-            console.print("[red]Error:[/red] --ai-commands-dir is required when using --ai generic")
-            console.print("[dim]Example: specify init my-project --ai generic --ai-commands-dir .myagent/commands/[/dim]")
+    # Auto-promote interactively selected agents to the integration path
+    if not ai_assistant:
+        resolved_integration = get_integration(selected_ai)
+        if not resolved_integration:
+            console.print(f"[red]Error:[/red] Unknown agent '{selected_ai}'")
             raise typer.Exit(1)
-    elif ai_commands_dir:
-        console.print(f"[red]Error:[/red] --ai-commands-dir can only be used with --ai generic (not '{selected_ai}')")
-        raise typer.Exit(1)
+
+    # Validate --ai-commands-dir usage.
+    # Skip validation when --integration-options is provided — the integration
+    # will validate its own options in setup().
+    if selected_ai == "generic" and not integration_options:
+        if not ai_commands_dir:
+            console.print("[red]Error:[/red] --ai-commands-dir is required when using --ai generic or --integration generic")
+            console.print('[dim]Example: specify init my-project --integration generic --integration-options="--commands-dir .myagent/commands/"[/dim]')
+            raise typer.Exit(1)
 
     current_dir = Path.cwd()
 
@@ -1484,12 +752,12 @@ def init(
     else:
         default_script = "ps" if os.name == "nt" else "sh"
 
-        if sys.stdin.isatty():
+        if _stdin_is_interactive():
             selected_script = select_with_arrows(SCRIPT_TYPE_CHOICES, "Choose script type (or press Enter)", default_script)
         else:
             selected_script = default_script
 
-    console.print(f"[cyan]Selected AI assistant:[/cyan] {selected_ai}")
+    console.print(f"[cyan]Selected coding agent integration:[/cyan] {selected_ai}")
     console.print(f"[cyan]Selected script type:[/cyan] {selected_script}")
 
     tracker = StepTracker("Initialize Specify Project")
@@ -1498,98 +766,260 @@ def init(
 
     tracker.add("precheck", "Check required tools")
     tracker.complete("precheck", "ok")
-    tracker.add("ai-select", "Select AI assistant")
+    tracker.add("ai-select", "Select coding agent integration")
     tracker.complete("ai-select", f"{selected_ai}")
     tracker.add("script-select", "Select script type")
     tracker.complete("script-select", selected_script)
+
+    tracker.add("integration", "Install integration")
+    tracker.add("shared-infra", "Install shared infrastructure")
+
     for key, label in [
-        ("fetch", "Fetch latest release"),
-        ("download", "Download template"),
-        ("extract", "Extract template"),
-        ("zip-list", "Archive contents"),
-        ("extracted-summary", "Extraction summary"),
         ("chmod", "Ensure scripts executable"),
         ("constitution", "Constitution setup"),
-    ]:
-        tracker.add(key, label)
-    if ai_skills:
-        tracker.add("ai-skills", "Install agent skills")
-    for key, label in [
-        ("cleanup", "Cleanup"),
-        ("git", "Initialize git repository"),
-        ("final", "Finalize")
+        ("git", "Install git extension"),
+        ("workflow", "Install bundled workflow"),
+        ("final", "Finalize"),
     ]:
         tracker.add(key, label)
 
-    # Track git error message outside Live context so it persists
-    git_error_message = None
+    git_default_notice = False
 
     with Live(tracker.render(), console=console, refresh_per_second=8, transient=True) as live:
         tracker.attach_refresh(lambda: live.update(tracker.render()))
         try:
-            verify = not skip_tls
-            local_ssl_context = ssl_context if verify else False
-            local_client = httpx.Client(verify=local_ssl_context)
+            # Integration-based scaffolding
+            from .integrations.manifest import IntegrationManifest
+            tracker.start("integration")
+            manifest = IntegrationManifest(
+                resolved_integration.key, project_path, version=get_speckit_version()
+            )
 
-            download_and_extract_template(project_path, selected_ai, selected_script, here, verbose=False, tracker=tracker, client=local_client, debug=debug, github_token=github_token)
+            # Forward all legacy CLI flags to the integration as parsed_options.
+            # Integrations receive every option and decide what to use;
+            # irrelevant keys are simply ignored by the integration's setup().
+            integration_parsed_options: dict[str, Any] = {}
+            if ai_commands_dir:
+                integration_parsed_options["commands_dir"] = ai_commands_dir
+            if ai_skills:
+                integration_parsed_options["skills"] = True
+            # Parse --integration-options and merge into parsed_options so
+            # flags like --skills reach the integration's setup().
+            if integration_options:
+                extra = _parse_integration_options(resolved_integration, integration_options)
+                if extra:
+                    integration_parsed_options.update(extra)
 
-            # For generic agent, rename placeholder directory to user-specified path
-            if selected_ai == "generic" and ai_commands_dir:
-                placeholder_dir = project_path / ".speckit" / "commands"
-                target_dir = project_path / ai_commands_dir
-                if placeholder_dir.is_dir():
-                    target_dir.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(placeholder_dir), str(target_dir))
-                    # Clean up empty .speckit dir if it's now empty
-                    speckit_dir = project_path / ".speckit"
-                    if speckit_dir.is_dir() and not any(speckit_dir.iterdir()):
-                        speckit_dir.rmdir()
+            resolved_integration.setup(
+                project_path, manifest,
+                parsed_options=integration_parsed_options or None,
+                script_type=selected_script,
+                raw_options=integration_options,
+            )
+            manifest.save()
 
-            ensure_executable_scripts(project_path, tracker=tracker)
+            integration_settings = _with_integration_setting(
+                {},
+                resolved_integration.key,
+                resolved_integration,
+                script_type=selected_script,
+                raw_options=integration_options,
+                parsed_options=integration_parsed_options or None,
+            )
+            _write_integration_json(
+                project_path,
+                resolved_integration.key,
+                [resolved_integration.key],
+                integration_settings,
+            )
+
+            tracker.complete("integration", resolved_integration.config.get("name", resolved_integration.key))
+
+            # Install shared infrastructure (scripts, templates)
+            tracker.start("shared-infra")
+            _install_shared_infra_or_exit(
+                project_path,
+                selected_script,
+                tracker=tracker,
+                force=force,
+                invoke_separator=resolved_integration.effective_invoke_separator(integration_parsed_options),
+            )
+            tracker.complete("shared-infra", f"scripts ({selected_script}) + templates")
 
             ensure_constitution_from_template(project_path, tracker=tracker)
 
-            if ai_skills:
-                skills_ok = install_ai_skills(project_path, selected_ai, tracker=tracker)
-
-                # When --ai-skills is used on a NEW project and skills were
-                # successfully installed, remove the command files that the
-                # template archive just created.  Skills replace commands, so
-                # keeping both would be confusing.  For --here on an existing
-                # repo we leave pre-existing commands untouched to avoid a
-                # breaking change.  We only delete AFTER skills succeed so the
-                # project always has at least one of {commands, skills}.
-                if skills_ok and not here:
-                    agent_cfg = AGENT_CONFIG.get(selected_ai, {})
-                    agent_folder = agent_cfg.get("folder", "")
-                    commands_subdir = agent_cfg.get("commands_subdir", "commands")
-                    if agent_folder:
-                        cmds_dir = project_path / agent_folder.rstrip("/") / commands_subdir
-                        if cmds_dir.exists():
-                            try:
-                                shutil.rmtree(cmds_dir)
-                            except OSError:
-                                # Best-effort cleanup: skills are already installed,
-                                # so leaving stale commands is non-fatal.
-                                console.print("[yellow]Warning: could not remove extracted commands directory[/yellow]")
-
             if not no_git:
                 tracker.start("git")
+                git_messages = []
+                git_has_error = False
+                # Step 1: Initialize git repo if needed
                 if is_git_repo(project_path):
-                    tracker.complete("git", "existing repo detected")
+                    git_messages.append("existing repo detected")
                 elif should_init_git:
                     success, error_msg = init_git_repo(project_path, quiet=True)
                     if success:
-                        tracker.complete("git", "initialized")
+                        git_messages.append("initialized")
                     else:
-                        tracker.error("git", "init failed")
-                        git_error_message = error_msg
+                        git_has_error = True
+                        # Sanitize multi-line error_msg to single line for tracker
+                        if error_msg:
+                            sanitized = error_msg.replace('\n', ' ').strip()
+                            git_messages.append(f"init failed: {sanitized[:120]}")
+                        else:
+                            git_messages.append("init failed")
                 else:
-                    tracker.skip("git", "git not available")
+                    git_messages.append("git not available")
+                # Step 2: Install bundled git extension
+                try:
+                    from .extensions import ExtensionManager
+                    bundled_path = _locate_bundled_extension("git")
+                    if bundled_path:
+                        manager = ExtensionManager(project_path)
+                        if manager.registry.is_installed("git"):
+                            git_messages.append("extension already installed")
+                        else:
+                            manager.install_from_directory(
+                                bundled_path, get_speckit_version()
+                            )
+                            git_default_notice = True
+                            git_messages.append("extension installed")
+                    else:
+                        git_has_error = True
+                        git_messages.append("bundled extension not found")
+                except Exception as ext_err:
+                    git_has_error = True
+                    git_messages.append(
+                        f"extension install failed during optional git setup: {_cli_error_detail(ext_err)[:120]}"
+                    )
+                summary = "; ".join(git_messages)
+                if git_has_error:
+                    tracker.error("git", summary)
+                else:
+                    tracker.complete("git", summary)
             else:
                 tracker.skip("git", "--no-git flag")
 
+            # Install bundled speckit workflow
+            try:
+                bundled_wf = _locate_bundled_workflow("speckit")
+                if bundled_wf:
+                    from .workflows.catalog import WorkflowRegistry
+                    from .workflows.engine import WorkflowDefinition
+                    wf_registry = WorkflowRegistry(project_path)
+                    if wf_registry.is_installed("speckit"):
+                        tracker.complete("workflow", "already installed")
+                    else:
+                        import shutil as _shutil
+                        dest_wf = project_path / ".specify" / "workflows" / "speckit"
+                        dest_wf.mkdir(parents=True, exist_ok=True)
+                        _shutil.copy2(
+                            bundled_wf / "workflow.yml",
+                            dest_wf / "workflow.yml",
+                        )
+                        definition = WorkflowDefinition.from_yaml(dest_wf / "workflow.yml")
+                        wf_registry.add("speckit", {
+                            "name": definition.name,
+                            "version": definition.version,
+                            "description": definition.description,
+                            "source": "bundled",
+                        })
+                        tracker.complete("workflow", "speckit installed")
+                else:
+                    tracker.skip("workflow", "bundled workflow not found")
+            except Exception as wf_err:
+                tracker.error(
+                    "workflow",
+                    f"install bundled workflow 'speckit' failed: {_cli_error_detail(wf_err)[:120]}",
+                )
+
+            # Fix permissions after all installs (scripts + extensions)
+            ensure_executable_scripts(project_path, tracker=tracker)
+
+            # Persist the CLI options so later operations (e.g. preset add)
+            # can adapt their behaviour without re-scanning the filesystem.
+            # Must be saved BEFORE preset install so _get_skills_dir() works.
+            init_opts = {
+                "ai": selected_ai,
+                "integration": resolved_integration.key,
+                "branch_numbering": branch_numbering or "sequential",
+                "context_file": resolved_integration.context_file,
+                "here": here,
+                "script": selected_script,
+                "speckit_version": get_speckit_version(),
+            }
+            # Ensure ai_skills is set for SkillsIntegration so downstream
+            # tools (extensions, presets) emit SKILL.md overrides correctly.
+            # Also set for integrations running in skills mode (e.g. Copilot
+            # with --skills).
+            from .integrations.base import SkillsIntegration as _SkillsPersist
+            if isinstance(resolved_integration, _SkillsPersist) or getattr(resolved_integration, "_skills_mode", False):
+                init_opts["ai_skills"] = True
+            save_init_options(project_path, init_opts)
+
+            # Install preset if specified
+            if preset:
+                try:
+                    from .presets import PresetManager, PresetCatalog, PresetError
+                    preset_manager = PresetManager(project_path)
+                    speckit_ver = get_speckit_version()
+
+                    # Try local directory first, then bundled, then catalog
+                    local_path = Path(preset).resolve()
+                    if local_path.is_dir() and (local_path / "preset.yml").exists():
+                        preset_manager.install_from_directory(local_path, speckit_ver)
+                    else:
+                        bundled_path = _locate_bundled_preset(preset)
+                        if bundled_path:
+                            preset_manager.install_from_directory(bundled_path, speckit_ver)
+                        else:
+                            preset_catalog = PresetCatalog(project_path)
+                            pack_info = preset_catalog.get_pack_info(preset)
+                            if not pack_info:
+                                console.print(f"[yellow]Warning:[/yellow] Preset '{preset}' not found in catalog. Skipping.")
+                            elif pack_info.get("bundled") and not pack_info.get("download_url"):
+                                from .extensions import REINSTALL_COMMAND
+                                console.print(
+                                    f"[yellow]Warning:[/yellow] Preset '{preset}' is bundled with spec-kit "
+                                    f"but could not be found in the installed package."
+                                )
+                                console.print(
+                                    "This usually means the spec-kit installation is incomplete or corrupted."
+                                )
+                                console.print(f"Try reinstalling: {REINSTALL_COMMAND}")
+                            else:
+                                zip_path = None
+                                try:
+                                    zip_path = preset_catalog.download_pack(preset)
+                                    preset_manager.install_from_zip(zip_path, speckit_ver)
+                                except PresetError as preset_err:
+                                    _print_cli_warning(
+                                        "install",
+                                        "preset",
+                                        preset,
+                                        preset_err,
+                                        continuing="Continuing without the optional preset.",
+                                    )
+                                finally:
+                                    if zip_path is not None:
+                                        # Clean up downloaded ZIP to avoid cache accumulation
+                                        try:
+                                            zip_path.unlink(missing_ok=True)
+                                        except OSError:
+                                            # Best-effort cleanup; failure to delete is non-fatal
+                                            pass
+                except Exception as preset_err:
+                    # Optional preset install must not abort project initialization.
+                    _print_cli_warning(
+                        "install",
+                        "preset",
+                        preset,
+                        preset_err,
+                        continuing="Continuing without the optional preset.",
+                    )
+
             tracker.complete("final", "project ready")
+        except (typer.Exit, SystemExit):
+            raise
         except Exception as e:
             tracker.error("final", str(e))
             console.print(Panel(f"Initialization failed: {e}", title="Failure", border_style="red"))
@@ -1602,7 +1032,7 @@ def init(
                 _label_width = max(len(k) for k, _ in _env_pairs)
                 env_lines = [f"{k.ljust(_label_width)} → [bright_black]{v}[/bright_black]" for k, v in _env_pairs]
                 console.print(Panel("\n".join(env_lines), title="Debug Environment", border_style="magenta"))
-            if not here and project_path.exists():
+            if not here and project_path.exists() and not dir_existed_before:
                 shutil.rmtree(project_path)
             raise typer.Exit(1)
         finally:
@@ -1610,23 +1040,6 @@ def init(
 
     console.print(tracker.render())
     console.print("\n[bold green]Project ready.[/bold green]")
-    
-    # Show git error details if initialization failed
-    if git_error_message:
-        console.print()
-        git_error_panel = Panel(
-            f"[yellow]Warning:[/yellow] Git repository initialization failed\n\n"
-            f"{git_error_message}\n\n"
-            f"[dim]You can initialize git manually later with:[/dim]\n"
-            f"[cyan]cd {project_path if not here else '.'}[/cyan]\n"
-            f"[cyan]git init[/cyan]\n"
-            f"[cyan]git add .[/cyan]\n"
-            f"[cyan]git commit -m \"Initial commit\"[/cyan]",
-            title="[red]Git Initialization Failed[/red]",
-            border_style="red",
-            padding=(1, 2)
-        )
-        console.print(git_error_panel)
 
     # Agent folder security notice
     agent_config = AGENT_CONFIG.get(selected_ai)
@@ -1643,6 +1056,28 @@ def init(
             console.print()
             console.print(security_notice)
 
+    if ai_deprecation_warning:
+        deprecation_notice = Panel(
+            ai_deprecation_warning,
+            title="[bold red]Deprecation Warning[/bold red]",
+            border_style="red",
+            padding=(1, 2),
+        )
+        console.print()
+        console.print(deprecation_notice)
+
+    if git_default_notice:
+        default_change_notice = Panel(
+            "The git extension is currently enabled by default during [bold]specify init[/bold].\n"
+            "Starting in [bold]v0.10.0[/bold], this will require explicit opt-in.\n"
+            "Use [bold]specify extension add git[/bold] after init when needed.",
+            title="[yellow]Notice: Git Default Changing[/yellow]",
+            border_style="yellow",
+            padding=(1, 2),
+        )
+        console.print()
+        console.print(default_change_notice)
+
     steps_lines = []
     if not here:
         steps_lines.append(f"1. Go to the project folder: [cyan]cd {project_name}[/cyan]")
@@ -1651,38 +1086,73 @@ def init(
         steps_lines.append("1. You're already in the project directory!")
         step_num = 2
 
-    # Add Codex-specific setup step if needed
-    if selected_ai == "codex":
-        codex_path = project_path / ".codex"
-        quoted_path = shlex.quote(str(codex_path))
-        if os.name == "nt":  # Windows
-            cmd = f"setx CODEX_HOME {quoted_path}"
-        else:  # Unix-like systems
-            cmd = f"export CODEX_HOME={quoted_path}"
-        
-        steps_lines.append(f"{step_num}. Set [cyan]CODEX_HOME[/cyan] environment variable before running Codex: [cyan]{cmd}[/cyan]")
+    # Determine skill display mode for the next-steps panel.
+    # Skills integrations (codex, claude, kimi, agy, trae, cursor-agent, copilot, devin) should show skill invocation syntax.
+    from .integrations.base import SkillsIntegration as _SkillsInt
+    _is_skills_integration = isinstance(resolved_integration, _SkillsInt) or getattr(resolved_integration, "_skills_mode", False)
+
+    codex_skill_mode = selected_ai == "codex" and (ai_skills or _is_skills_integration)
+    claude_skill_mode = selected_ai == "claude" and (ai_skills or _is_skills_integration)
+    kimi_skill_mode = selected_ai == "kimi"
+    agy_skill_mode = selected_ai == "agy" and _is_skills_integration
+    trae_skill_mode = selected_ai == "trae"
+    cursor_agent_skill_mode = selected_ai == "cursor-agent" and (ai_skills or _is_skills_integration)
+    copilot_skill_mode = selected_ai == "copilot" and _is_skills_integration
+    devin_skill_mode = selected_ai == "devin"
+    native_skill_mode = codex_skill_mode or claude_skill_mode or kimi_skill_mode or agy_skill_mode or trae_skill_mode or cursor_agent_skill_mode or copilot_skill_mode or devin_skill_mode
+
+    if codex_skill_mode and not ai_skills:
+        # Integration path installed skills; show the helpful notice
+        steps_lines.append(f"{step_num}. Start Codex in this project directory; spec-kit skills were installed to [cyan].agents/skills[/cyan]")
         step_num += 1
+    if claude_skill_mode and not ai_skills:
+        steps_lines.append(f"{step_num}. Start Claude in this project directory; spec-kit skills were installed to [cyan].claude/skills[/cyan]")
+        step_num += 1
+    if cursor_agent_skill_mode and not ai_skills:
+        steps_lines.append(f"{step_num}. Start Cursor Agent in this project directory; spec-kit skills were installed to [cyan].cursor/skills[/cyan]")
+        step_num += 1
+    if devin_skill_mode:
+        steps_lines.append(f"{step_num}. Start Devin in this project directory; spec-kit skills were installed to [cyan].devin/skills[/cyan]")
+        step_num += 1
+    usage_label = "skills" if native_skill_mode else "slash commands"
 
-    steps_lines.append(f"{step_num}. Start using slash commands with your AI agent:")
+    def _display_cmd(name: str) -> str:
+        if codex_skill_mode or agy_skill_mode or trae_skill_mode:
+            return f"$speckit-{name}"
+        if claude_skill_mode:
+            return f"/speckit-{name}"
+        if kimi_skill_mode:
+            return f"/skill:speckit-{name}"
+        if cursor_agent_skill_mode or copilot_skill_mode or devin_skill_mode:
+            return f"/speckit-{name}"
+        return f"/speckit.{name}"
 
-    steps_lines.append("   2.1 [cyan]/speckit.constitution[/] - Establish project principles")
-    steps_lines.append("   2.2 [cyan]/speckit.specify[/] - Create baseline specification")
-    steps_lines.append("   2.3 [cyan]/speckit.plan[/] - Create implementation plan")
-    steps_lines.append("   2.4 [cyan]/speckit.tasks[/] - Generate actionable tasks")
-    steps_lines.append("   2.5 [cyan]/speckit.implement[/] - Execute implementation")
+    steps_lines.append(f"{step_num}. Start using {usage_label} with your coding agent:")
+
+    steps_lines.append(f"   {step_num}.1 [cyan]{_display_cmd('constitution')}[/] - Establish project principles")
+    steps_lines.append(f"   {step_num}.2 [cyan]{_display_cmd('specify')}[/] - Create baseline specification")
+    steps_lines.append(f"   {step_num}.3 [cyan]{_display_cmd('plan')}[/] - Create implementation plan")
+    steps_lines.append(f"   {step_num}.4 [cyan]{_display_cmd('tasks')}[/] - Generate actionable tasks")
+    steps_lines.append(f"   {step_num}.5 [cyan]{_display_cmd('implement')}[/] - Execute implementation")
 
     steps_panel = Panel("\n".join(steps_lines), title="Next Steps", border_style="cyan", padding=(1,2))
     console.print()
     console.print(steps_panel)
 
+    enhancement_intro = (
+        "Optional skills that you can use for your specs [bright_black](improve quality & confidence)[/bright_black]"
+        if native_skill_mode
+        else "Optional commands that you can use for your specs [bright_black](improve quality & confidence)[/bright_black]"
+    )
     enhancement_lines = [
-        "Optional commands that you can use for your specs [bright_black](improve quality & confidence)[/bright_black]",
+        enhancement_intro,
         "",
-        "○ [cyan]/speckit.clarify[/] [bright_black](optional)[/bright_black] - Ask structured questions to de-risk ambiguous areas before planning (run before [cyan]/speckit.plan[/] if used)",
-        "○ [cyan]/speckit.analyze[/] [bright_black](optional)[/bright_black] - Cross-artifact consistency & alignment report (after [cyan]/speckit.tasks[/], before [cyan]/speckit.implement[/])",
-        "○ [cyan]/speckit.checklist[/] [bright_black](optional)[/bright_black] - Generate quality checklists to validate requirements completeness, clarity, and consistency (after [cyan]/speckit.plan[/])"
+        f"○ [cyan]{_display_cmd('clarify')}[/] [bright_black](optional)[/bright_black] - Ask structured questions to de-risk ambiguous areas before planning (run before [cyan]{_display_cmd('plan')}[/] if used)",
+        f"○ [cyan]{_display_cmd('analyze')}[/] [bright_black](optional)[/bright_black] - Cross-artifact consistency & alignment report (after [cyan]{_display_cmd('tasks')}[/], before [cyan]{_display_cmd('implement')}[/])",
+        f"○ [cyan]{_display_cmd('checklist')}[/] [bright_black](optional)[/bright_black] - Generate quality checklists to validate requirements completeness, clarity, and consistency (after [cyan]{_display_cmd('plan')}[/])"
     ]
-    enhancements_panel = Panel("\n".join(enhancement_lines), title="Enhancement Commands", border_style="cyan", padding=(1,2))
+    enhancements_title = "Enhancement Skills" if native_skill_mode else "Enhancement Commands"
+    enhancements_panel = Panel("\n".join(enhancement_lines), title=enhancements_title, border_style="cyan", padding=(1,2))
     console.print()
     console.print(enhancements_panel)
 
@@ -1728,71 +1198,68 @@ def check():
         console.print("[dim]Tip: Install git for repository management[/dim]")
 
     if not any(agent_results.values()):
-        console.print("[dim]Tip: Install an AI assistant for the best experience[/dim]")
+        console.print("[dim]Tip: Install a coding agent for the best experience[/dim]")
+
+    console.print("[dim]Tip: Run 'specify self check' to verify you have the latest CLI version[/dim]")
+
+
+def _feature_capabilities() -> dict[str, bool]:
+    """Return stable local CLI capability flags for humans and agents."""
+    return {
+        "controlled_multi_install_integrations": True,
+        "integration_use_command": True,
+        "multi_install_safe_registry_metadata": True,
+        "integration_upgrade_command": True,
+        "self_check_command": True,
+        "workflow_catalog": True,
+        "bundled_templates": True,
+    }
+
 
 @app.command()
-def version():
+def version(
+    features: bool = typer.Option(
+        False,
+        "--features",
+        help="Show local CLI feature capabilities.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit feature capabilities as JSON. Requires --features.",
+    ),
+):
     """Display version and system information."""
     import platform
-    import importlib.metadata
-    
+
+    cli_version = get_speckit_version()
+
+    if json_output and not features:
+        console.print("[red]Error:[/red] --json requires --features.")
+        raise typer.Exit(1)
+
+    if features:
+        capabilities = _feature_capabilities()
+        if json_output:
+            payload = {"version": cli_version, "features": capabilities}
+            console.print(json.dumps(payload, indent=2))
+            return
+
+        console.print(f"Spec Kit CLI: {cli_version}")
+        console.print()
+        console.print("Features:")
+        for key, enabled in capabilities.items():
+            label = key.replace("_", " ")
+            console.print(f"- {label}: {'yes' if enabled else 'no'}")
+        return
+
     show_banner()
-    
-    # Get CLI version from package metadata
-    cli_version = "unknown"
-    try:
-        cli_version = importlib.metadata.version("specify-cli")
-    except Exception:
-        # Fallback: try reading from pyproject.toml if running from source
-        try:
-            import tomllib
-            pyproject_path = Path(__file__).parent.parent.parent / "pyproject.toml"
-            if pyproject_path.exists():
-                with open(pyproject_path, "rb") as f:
-                    data = tomllib.load(f)
-                    cli_version = data.get("project", {}).get("version", "unknown")
-        except Exception:
-            pass
-    
-    # Fetch latest template release version
-    repo_owner = "github"
-    repo_name = "spec-kit"
-    api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
-    
-    template_version = "unknown"
-    release_date = "unknown"
-    
-    try:
-        response = client.get(
-            api_url,
-            timeout=10,
-            follow_redirects=True,
-            headers=_github_auth_headers(),
-        )
-        if response.status_code == 200:
-            release_data = response.json()
-            template_version = release_data.get("tag_name", "unknown")
-            # Remove 'v' prefix if present
-            if template_version.startswith("v"):
-                template_version = template_version[1:]
-            release_date = release_data.get("published_at", "unknown")
-            if release_date != "unknown":
-                # Format the date nicely
-                try:
-                    dt = datetime.fromisoformat(release_date.replace('Z', '+00:00'))
-                    release_date = dt.strftime("%Y-%m-%d")
-                except Exception:
-                    pass
-    except Exception:
-        pass
 
     info_table = Table(show_header=False, box=None, padding=(0, 2))
     info_table.add_column("Key", style="cyan", justify="right")
     info_table.add_column("Value", style="white")
 
     info_table.add_row("CLI Version", cli_version)
-    info_table.add_row("Template Version", template_version)
-    info_table.add_row("Released", release_date)
     info_table.add_row("", "")
     info_table.add_row("Python", platform.python_version())
     info_table.add_row("Platform", platform.system())
@@ -1808,6 +1275,8 @@ def version():
 
     console.print(panel)
     console.print()
+
+app.add_typer(_self_app, name="self")
 
 
 # ===== Extension Commands =====
@@ -1826,26 +1295,2053 @@ catalog_app = typer.Typer(
 )
 extension_app.add_typer(catalog_app, name="catalog")
 
+preset_app = typer.Typer(
+    name="preset",
+    help="Manage spec-kit presets",
+    add_completion=False,
+)
+app.add_typer(preset_app, name="preset")
 
-def get_speckit_version() -> str:
-    """Get current spec-kit version."""
-    import importlib.metadata
-    try:
-        return importlib.metadata.version("specify-cli")
-    except Exception:
-        # Fallback: try reading from pyproject.toml
+preset_catalog_app = typer.Typer(
+    name="catalog",
+    help="Manage preset catalogs",
+    add_completion=False,
+)
+preset_app.add_typer(preset_catalog_app, name="catalog")
+
+
+# ===== Integration Commands =====
+
+integration_app = typer.Typer(
+    name="integration",
+    help="Manage coding agent integrations",
+    add_completion=False,
+)
+app.add_typer(integration_app, name="integration")
+
+integration_catalog_app = typer.Typer(
+    name="catalog",
+    help="Manage integration catalog sources",
+    add_completion=False,
+)
+integration_app.add_typer(integration_catalog_app, name="catalog")
+
+
+def _read_integration_json(project_root: Path) -> dict[str, Any]:
+    """Load ``.specify/integration.json``. Returns normalized state when present.
+
+    Delegates the parse / schema-guard logic to the shared
+    :func:`_try_read_integration_json` helper so the CLI and workflow engine
+    cannot drift on validation rules. Each error variant is translated into
+    the existing loud-fail UX (console message + ``typer.Exit(1)``).
+    """
+    path = project_root / INTEGRATION_JSON
+    state, error = _try_read_integration_json(project_root)
+    if error is None:
+        return state or {}
+    if error.kind == "decode":
+        console.print(f"[red]Error:[/red] {path} contains invalid JSON or is not valid UTF-8.")
+        console.print(f"Please fix or delete {INTEGRATION_JSON} and retry.")
+        console.print(f"[dim]Details:[/dim] {error.detail}")
+    elif error.kind == "os":
+        console.print(f"[red]Error:[/red] Could not read {path}.")
+        console.print(f"Please fix file permissions or delete {INTEGRATION_JSON} and retry.")
+        console.print(f"[dim]Details:[/dim] {error.detail}")
+    elif error.kind == "not_object":
+        console.print(
+            f"[red]Error:[/red] {path} must contain a JSON object, got {error.detail}."
+        )
+        console.print(f"Please fix or delete {INTEGRATION_JSON} and retry.")
+    elif error.kind == "schema_too_new":
+        console.print(
+            f"[red]Error:[/red] {path} uses integration state schema {error.schema}, "
+            f"but this CLI only supports schema {INTEGRATION_STATE_SCHEMA}."
+        )
+        console.print("Please upgrade Spec Kit before modifying integrations.")
+    raise typer.Exit(1)
+
+
+def _write_integration_json(
+    project_root: Path,
+    integration_key: str | None,
+    installed_integrations: list[str] | None = None,
+    integration_settings: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Write ``.specify/integration.json`` with legacy-compatible state."""
+    _write_integration_json_file(
+        project_root,
+        version=get_speckit_version(),
+        integration_key=integration_key,
+        installed_integrations=installed_integrations,
+        settings=integration_settings,
+    )
+
+
+def _clear_init_options_for_integration(project_root: Path, integration_key: str) -> None:
+    """Clear active integration keys from init-options.json when they match."""
+    opts = load_init_options(project_root)
+    if opts.get("integration") == integration_key or opts.get("ai") == integration_key:
+        opts.pop("integration", None)
+        opts.pop("ai", None)
+        opts.pop("ai_skills", None)
+        opts.pop("context_file", None)
+        save_init_options(project_root, opts)
+
+
+def _remove_integration_json(project_root: Path) -> None:
+    """Remove ``.specify/integration.json`` if it exists."""
+    path = project_root / INTEGRATION_JSON
+    if path.exists():
+        path.unlink()
+
+
+_MANIFEST_READ_ERRORS = (ValueError, FileNotFoundError, OSError, UnicodeDecodeError)
+
+
+class _SharedTemplateRefreshError(RuntimeError):
+    """Raised when default integration metadata should not be persisted."""
+
+
+def _normalize_script_type(script_type: str, source: str) -> str:
+    """Normalize and validate a script type from CLI/config sources."""
+    normalized = script_type.strip().lower()
+    if normalized in SCRIPT_TYPE_CHOICES:
+        return normalized
+    console.print(
+        f"[red]Error:[/red] Invalid script type {script_type!r} from {source}. "
+        f"Expected one of: {', '.join(sorted(SCRIPT_TYPE_CHOICES.keys()))}."
+    )
+    raise typer.Exit(1)
+
+
+def _resolve_script_type(project_root: Path, script_type: str | None) -> str:
+    """Resolve the script type from the CLI flag or init-options.json."""
+    if script_type:
+        return _normalize_script_type(script_type, "--script")
+    opts = load_init_options(project_root)
+    saved = opts.get("script")
+    if isinstance(saved, str) and saved.strip():
+        return _normalize_script_type(saved, ".specify/init-options.json")
+    return "ps" if os.name == "nt" else "sh"
+
+
+def _resolve_integration_script_type(
+    project_root: Path,
+    state: dict[str, Any],
+    key: str,
+    script_type: str | None = None,
+) -> str:
+    """Resolve script type for an integration, preferring stored settings."""
+    if script_type:
+        return _normalize_script_type(script_type, "--script")
+
+    stored = _integration_setting(state, key).get("script")
+    if isinstance(stored, str) and stored.strip():
+        return _normalize_script_type(stored, f"{INTEGRATION_JSON} integration_settings.{key}.script")
+
+    return _resolve_script_type(project_root, None)
+
+
+def _resolve_integration_options(
+    integration: Any,
+    state: dict[str, Any],
+    key: str,
+    raw_options: str | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Resolve raw and parsed options for an integration operation."""
+    return _resolve_integration_options_impl(
+        integration,
+        state,
+        key,
+        raw_options,
+        parse_options=_parse_integration_options,
+    )
+
+
+def _set_default_integration(
+    project_root: Path,
+    state: dict[str, Any],
+    key: str,
+    integration: Any,
+    installed_keys: list[str],
+    *,
+    script_type: str | None = None,
+    raw_options: str | None = None,
+    parsed_options: dict[str, Any] | None = None,
+    refresh_templates: bool = True,
+    refresh_templates_force: bool = False,
+) -> None:
+    """Persist *key* as default and align active runtime metadata."""
+    resolved_script = _resolve_integration_script_type(project_root, state, key, script_type)
+    settings = _with_integration_setting(
+        state,
+        key,
+        integration,
+        script_type=resolved_script,
+        raw_options=raw_options,
+        parsed_options=parsed_options,
+    )
+
+    if refresh_templates:
         try:
-            import tomllib
-            pyproject_path = Path(__file__).parent.parent.parent / "pyproject.toml"
-            if pyproject_path.exists():
-                with open(pyproject_path, "rb") as f:
-                    data = tomllib.load(f)
-                    return data.get("project", {}).get("version", "unknown")
-        except Exception:
-            # Intentionally ignore any errors while reading/parsing pyproject.toml.
-            # If this lookup fails for any reason, we fall back to returning "unknown" below.
-            pass
-    return "unknown"
+            _refresh_shared_templates(
+                project_root,
+                invoke_separator=_invoke_separator_for_integration(
+                    integration, {"integration_settings": settings}, key, parsed_options
+                ),
+                force=refresh_templates_force,
+            )
+        except (ValueError, OSError) as exc:
+            raise _SharedTemplateRefreshError(
+                f"Failed to refresh shared templates for '{key}': {exc}"
+            ) from exc
+
+    _write_integration_json(project_root, key, installed_keys, settings)
+    _update_init_options_for_integration(project_root, integration, script_type=resolved_script)
+
+
+def _set_default_integration_or_exit(*args: Any, **kwargs: Any) -> None:
+    try:
+        _set_default_integration(*args, **kwargs)
+    except _SharedTemplateRefreshError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+
+def _require_specify_project() -> Path:
+    """Return the current project root if it is a spec-kit project, else exit."""
+    project_root = Path.cwd()
+    if (project_root / ".specify").is_dir():
+        return project_root
+    console.print("[red]Error:[/red] Not a spec-kit project (no .specify/ directory)")
+    console.print("Run this command from a spec-kit project root")
+    raise typer.Exit(1)
+
+
+@integration_app.command("list")
+def integration_list(
+    catalog: bool = typer.Option(False, "--catalog", help="Browse full catalog (built-in + community)"),
+):
+    """List available integrations and installed status."""
+    from .integrations import INTEGRATION_REGISTRY
+
+    project_root = _require_specify_project()
+    current = _read_integration_json(project_root)
+    default_key = _default_integration_key(current)
+    installed_keys = set(_installed_integration_keys(current))
+
+    if catalog:
+        from .integrations.catalog import IntegrationCatalog, IntegrationCatalogError
+
+        ic = IntegrationCatalog(project_root)
+        try:
+            entries = ic.search()
+        except IntegrationCatalogError as exc:
+            console.print(f"[red]Error:[/red] {exc}")
+            raise typer.Exit(1)
+
+        if not entries:
+            console.print("[yellow]No integrations found in catalog.[/yellow]")
+            return
+
+        table = Table(title="Integration Catalog")
+        table.add_column("ID", style="cyan")
+        table.add_column("Name")
+        table.add_column("Version")
+        table.add_column("Source")
+        table.add_column("Status")
+        table.add_column("Multi-install Safe")
+
+        for entry in sorted(entries, key=lambda e: e["id"]):
+            eid = entry["id"]
+            cat_name = entry.get("_catalog_name", "")
+            install_allowed = entry.get("_install_allowed", True)
+            if eid == default_key:
+                status = "[green]installed (default)[/green]"
+            elif eid in installed_keys:
+                status = "[green]installed[/green]"
+            elif eid in INTEGRATION_REGISTRY:
+                status = "built-in"
+            elif install_allowed is False:
+                status = "discovery-only"
+            else:
+                status = ""
+            safe = ""
+            if eid in INTEGRATION_REGISTRY:
+                safe = "yes" if getattr(INTEGRATION_REGISTRY[eid], "multi_install_safe", False) else "no"
+            table.add_row(
+                eid,
+                entry.get("name", eid),
+                entry.get("version", ""),
+                cat_name,
+                status,
+                safe,
+            )
+
+        console.print(table)
+        return
+
+    table = Table(title="Coding Agent Integrations")
+    table.add_column("Key", style="cyan")
+    table.add_column("Name")
+    table.add_column("Status")
+    table.add_column("CLI Required")
+    table.add_column("Multi-install Safe")
+
+    for key in sorted(INTEGRATION_REGISTRY.keys()):
+        integration = INTEGRATION_REGISTRY[key]
+        cfg = integration.config or {}
+        name = cfg.get("name", key)
+        requires_cli = cfg.get("requires_cli", False)
+
+        if key == default_key:
+            status = "[green]installed (default)[/green]"
+        elif key in installed_keys:
+            status = "[green]installed[/green]"
+        else:
+            status = ""
+
+        cli_req = "yes" if requires_cli else "no (IDE)"
+        safe = "yes" if getattr(integration, "multi_install_safe", False) else "no"
+        table.add_row(key, name, status, cli_req, safe)
+
+    console.print(table)
+
+    if installed_keys:
+        console.print(f"\n[dim]Default integration:[/dim] [cyan]{default_key or 'none'}[/cyan]")
+        console.print(f"[dim]Installed integrations:[/dim] [cyan]{', '.join(sorted(installed_keys))}[/cyan]")
+    else:
+        console.print("\n[yellow]No integration currently installed.[/yellow]")
+        console.print("Install one with: [cyan]specify integration install <key>[/cyan]")
+
+
+@integration_app.command("install")
+def integration_install(
+    key: str = typer.Argument(help="Integration key to install (e.g. claude, copilot)"),
+    script: str | None = typer.Option(None, "--script", help="Script type: sh or ps (default: from init-options.json or platform default)"),
+    force: bool = typer.Option(False, "--force", help="Allow multi-install when integrations are not declared safe"),
+    integration_options: str | None = typer.Option(None, "--integration-options", help='Options for the integration (e.g. --integration-options="--commands-dir .myagent/cmds")'),
+):
+    """Install an integration into an existing project."""
+    from .integrations import INTEGRATION_REGISTRY, get_integration
+    from .integrations.manifest import IntegrationManifest
+
+    project_root = _require_specify_project()
+    integration = get_integration(key)
+    if integration is None:
+        console.print(f"[red]Error:[/red] Unknown integration '{key}'")
+        available = ", ".join(sorted(INTEGRATION_REGISTRY.keys()))
+        console.print(f"Available integrations: {available}")
+        raise typer.Exit(1)
+
+    current = _read_integration_json(project_root)
+    default_key = _default_integration_key(current)
+    installed_keys = _installed_integration_keys(current)
+
+    if key in installed_keys:
+        console.print(f"[yellow]Integration '{key}' is already installed.[/yellow]")
+        if default_key == key:
+            console.print("It is already the default integration.")
+        else:
+            console.print(
+                f"To make it the default integration, run "
+                f"[cyan]specify integration use {key}[/cyan]."
+            )
+        console.print(
+            f"To refresh its managed files or options, run "
+            f"[cyan]specify integration upgrade {key}[/cyan]."
+        )
+        console.print("No files were changed.")
+        raise typer.Exit(0)
+
+    if installed_keys and not force:
+        unsafe_keys = []
+        for installed_key in installed_keys:
+            installed_integration = get_integration(installed_key)
+            if not installed_integration or not getattr(installed_integration, "multi_install_safe", False):
+                unsafe_keys.append(installed_key)
+        if unsafe_keys or not getattr(integration, "multi_install_safe", False):
+            console.print(
+                f"[red]Error:[/red] Installed integrations: {', '.join(installed_keys)}."
+            )
+            if default_key:
+                console.print(f"Default integration: [cyan]{default_key}[/cyan].")
+            console.print(
+                "Installing multiple integrations is only automatic when all involved "
+                "integrations are declared multi-install safe."
+            )
+            console.print(
+                f"To replace the default integration, run "
+                f"[cyan]specify integration switch {key}[/cyan]."
+            )
+            console.print(
+                f"To install '{key}' alongside the existing integrations anyway, "
+                "retry the same install command with [cyan]--force[/cyan]."
+            )
+            raise typer.Exit(1)
+
+    selected_script = _resolve_script_type(project_root, script)
+
+    # Build parsed options from --integration-options so the integration
+    # can determine its effective invoke separator before shared infra
+    # is installed.
+    raw_options, parsed_options = _resolve_integration_options(
+        integration, current, key, integration_options
+    )
+
+    # Ensure shared infrastructure is present (safe to run unconditionally;
+    # _install_shared_infra merges missing files without overwriting).
+    infra_integration = integration
+    infra_key = key
+    infra_parsed = parsed_options
+    if default_key:
+        default_integration = get_integration(default_key)
+        if default_integration is not None:
+            infra_integration = default_integration
+            infra_key = default_key
+            _, infra_parsed = _resolve_integration_options(
+                default_integration, current, default_key, None
+            )
+    _install_shared_infra_or_exit(
+        project_root,
+        selected_script,
+        invoke_separator=_invoke_separator_for_integration(
+            infra_integration, current, infra_key, infra_parsed
+        ),
+    )
+    if os.name != "nt":
+        ensure_executable_scripts(project_root)
+
+    manifest = IntegrationManifest(
+        integration.key, project_root, version=get_speckit_version()
+    )
+
+    try:
+        integration.setup(
+            project_root, manifest,
+            parsed_options=parsed_options,
+            script_type=selected_script,
+            raw_options=raw_options,
+        )
+        manifest.save()
+        new_installed = _dedupe_integration_keys([*installed_keys, integration.key])
+        new_default = default_key or integration.key
+        settings = _with_integration_setting(
+            current,
+            integration.key,
+            integration,
+            script_type=selected_script,
+            raw_options=raw_options,
+            parsed_options=parsed_options,
+        )
+        _write_integration_json(project_root, new_default, new_installed, settings)
+        if new_default == integration.key:
+            _update_init_options_for_integration(project_root, integration, script_type=selected_script)
+
+    except Exception as exc:
+        # Attempt rollback of any files written by setup
+        try:
+            integration.teardown(project_root, manifest, force=True)
+        except Exception as rollback_err:
+            # Suppress so the original setup error remains the primary failure
+            _print_cli_warning(
+                "rollback",
+                "integration",
+                key,
+                rollback_err,
+                continuing="The original install failure is still the primary error.",
+            )
+        if installed_keys:
+            _write_integration_json(
+                project_root, default_key, installed_keys, _integration_settings(current)
+            )
+        else:
+            _remove_integration_json(project_root)
+        console.print(
+            f"[red]Error:[/red] Failed to {_cli_phase_label('install', 'integration', key)}: "
+            f"{_cli_error_detail(exc)}"
+        )
+        raise typer.Exit(1)
+
+    name = (integration.config or {}).get("name", key)
+    console.print(f"\n[green]✓[/green] Integration '{name}' installed successfully")
+    if default_key:
+        console.print(f"[dim]Default integration remains:[/dim] [cyan]{default_key}[/cyan]")
+
+
+def _parse_integration_options(integration: Any, raw_options: str) -> dict[str, Any] | None:
+    """Parse --integration-options string into a dict matching the integration's declared options.
+
+    Returns ``None`` when no options are provided.
+    """
+    import shlex
+    parsed: dict[str, Any] = {}
+    tokens = shlex.split(raw_options)
+    declared_options = list(integration.options())
+    declared = {opt.name.lstrip("-"): opt for opt in declared_options}
+    allowed = ", ".join(sorted(opt.name for opt in declared_options))
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if not token.startswith("-"):
+            console.print(f"[red]Error:[/red] Unexpected integration option value '{token}'.")
+            if allowed:
+                console.print(f"Allowed options: {allowed}")
+            raise typer.Exit(1)
+        name = token.lstrip("-")
+        value: str | None = None
+        # Handle --name=value syntax
+        if "=" in name:
+            name, value = name.split("=", 1)
+        opt = declared.get(name)
+        if not opt:
+            console.print(f"[red]Error:[/red] Unknown integration option '{token}'.")
+            if allowed:
+                console.print(f"Allowed options: {allowed}")
+            raise typer.Exit(1)
+        key = name.replace("-", "_")
+        if opt.is_flag:
+            if value is not None:
+                console.print(f"[red]Error:[/red] Option '{opt.name}' is a flag and does not accept a value.")
+                raise typer.Exit(1)
+            parsed[key] = True
+            i += 1
+        elif value is not None:
+            parsed[key] = value
+            i += 1
+        elif i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+            parsed[key] = tokens[i + 1]
+            i += 2
+        else:
+            console.print(f"[red]Error:[/red] Option '{opt.name}' requires a value.")
+            raise typer.Exit(1)
+    return parsed or None
+
+
+def _update_init_options_for_integration(
+    project_root: Path,
+    integration: Any,
+    script_type: str | None = None,
+) -> None:
+    """Update ``init-options.json`` to reflect *integration* as the active one."""
+    from .integrations.base import SkillsIntegration
+    opts = load_init_options(project_root)
+    opts["integration"] = integration.key
+    opts["ai"] = integration.key
+    opts["context_file"] = integration.context_file
+    if script_type:
+        opts["script"] = script_type
+    if isinstance(integration, SkillsIntegration) or getattr(integration, "_skills_mode", False):
+        opts["ai_skills"] = True
+    else:
+        opts.pop("ai_skills", None)
+    save_init_options(project_root, opts)
+
+
+@integration_app.command("use")
+def integration_use(
+    key: str = typer.Argument(help="Installed integration key to make the default"),
+    force: bool = typer.Option(False, "--force", help="Overwrite managed shared templates while changing the default"),
+):
+    """Set the default integration without uninstalling other integrations."""
+    from .integrations import get_integration
+
+    project_root = _require_specify_project()
+    current = _read_integration_json(project_root)
+    installed_keys = _installed_integration_keys(current)
+    if key not in installed_keys:
+        console.print(f"[red]Error:[/red] Integration '{key}' is not installed.")
+        if installed_keys:
+            console.print(f"[yellow]Installed integrations:[/yellow] {', '.join(installed_keys)}")
+        else:
+            console.print("Install one with: [cyan]specify integration install <key>[/cyan]")
+        raise typer.Exit(1)
+
+    integration = get_integration(key)
+    if integration is None:
+        console.print(f"[red]Error:[/red] Unknown integration '{key}'")
+        raise typer.Exit(1)
+
+    raw_options, parsed_options = _resolve_integration_options(integration, current, key, None)
+    _set_default_integration_or_exit(
+        project_root,
+        current,
+        key,
+        integration,
+        installed_keys,
+        raw_options=raw_options,
+        parsed_options=parsed_options,
+        refresh_templates_force=force,
+    )
+    console.print(f"[green]✓[/green] Default integration set to [bold]{key}[/bold].")
+
+
+@integration_app.command("uninstall")
+def integration_uninstall(
+    key: str = typer.Argument(None, help="Integration key to uninstall (default: current integration)"),
+    force: bool = typer.Option(False, "--force", help="Remove files even if modified"),
+):
+    """Uninstall an integration, safely preserving modified files."""
+    from .integrations import get_integration
+    from .integrations.manifest import IntegrationManifest
+
+    project_root = _require_specify_project()
+    current = _read_integration_json(project_root)
+    default_key = _default_integration_key(current)
+    installed_keys = _installed_integration_keys(current)
+
+    if key is None:
+        if not default_key:
+            console.print("[yellow]No integration is currently installed.[/yellow]")
+            raise typer.Exit(0)
+        key = default_key
+
+    if key not in installed_keys:
+        console.print(f"[red]Error:[/red] Integration '{key}' is not installed.")
+        raise typer.Exit(1)
+
+    integration = get_integration(key)
+
+    manifest_path = project_root / ".specify" / "integrations" / f"{key}.manifest.json"
+    if not manifest_path.exists():
+        console.print(f"[yellow]No manifest found for integration '{key}'. Nothing to uninstall.[/yellow]")
+        remaining = [installed for installed in installed_keys if installed != key]
+        new_default = default_key if default_key != key else (remaining[0] if remaining else None)
+        if remaining:
+            if default_key == key and new_default and (new_integration := get_integration(new_default)):
+                raw_options, parsed_options = _resolve_integration_options(
+                    new_integration, current, new_default, None
+                )
+                _set_default_integration_or_exit(
+                    project_root,
+                    current,
+                    new_default,
+                    new_integration,
+                    remaining,
+                    raw_options=raw_options,
+                    parsed_options=parsed_options,
+                )
+            else:
+                _write_integration_json(
+                    project_root, new_default, remaining, _integration_settings(current)
+                )
+        else:
+            _remove_integration_json(project_root)
+        if default_key == key:
+            _clear_init_options_for_integration(project_root, key)
+        raise typer.Exit(0)
+
+    try:
+        manifest = IntegrationManifest.load(key, project_root)
+    except _MANIFEST_READ_ERRORS as exc:
+        console.print(f"[red]Error:[/red] Integration manifest for '{key}' is unreadable.")
+        console.print(f"Manifest: {manifest_path}")
+        console.print(
+            f"To recover, delete the unreadable manifest, run "
+            f"[cyan]specify integration uninstall {key}[/cyan] to clear stale metadata, "
+            f"then run [cyan]specify integration install {key}[/cyan] to regenerate."
+        )
+        console.print(f"[dim]Details:[/dim] {exc}")
+        raise typer.Exit(1)
+
+    removed, skipped = manifest.uninstall(project_root, force=force)
+
+    # Remove managed context section from the agent context file
+    if integration:
+        integration.remove_context_section(project_root)
+
+    remaining = [installed for installed in installed_keys if installed != key]
+    new_default = default_key if default_key != key else (remaining[0] if remaining else None)
+    if remaining:
+        if default_key == key and new_default and (new_integration := get_integration(new_default)):
+            raw_options, parsed_options = _resolve_integration_options(
+                new_integration, current, new_default, None
+            )
+            _set_default_integration_or_exit(
+                project_root,
+                current,
+                new_default,
+                new_integration,
+                remaining,
+                raw_options=raw_options,
+                parsed_options=parsed_options,
+            )
+        else:
+            _write_integration_json(
+                project_root, new_default, remaining, _integration_settings(current)
+            )
+    else:
+        _remove_integration_json(project_root)
+
+    if default_key == key:
+        _clear_init_options_for_integration(project_root, key)
+
+    name = (integration.config or {}).get("name", key) if integration else key
+    console.print(f"\n[green]✓[/green] Integration '{name}' uninstalled")
+    if removed:
+        console.print(f"  Removed {len(removed)} file(s)")
+    if skipped:
+        console.print(f"\n[yellow]⚠[/yellow]  {len(skipped)} modified file(s) were preserved:")
+        for path in skipped:
+            rel = _display_project_path(project_root, path)
+            console.print(f"    {rel}")
+
+
+@integration_app.command("switch")
+def integration_switch(
+    target: str = typer.Argument(help="Integration key to switch to"),
+    script: str | None = typer.Option(None, "--script", help="Script type: sh or ps (default: from init-options.json or platform default)"),
+    force: bool = typer.Option(False, "--force", help="Force removal of modified files during uninstall of the previous integration"),
+    refresh_shared_infra: bool = typer.Option(False, "--refresh-shared-infra", help="Also overwrite shared infrastructure files even if you customized them (otherwise customizations are preserved)"),
+    integration_options: str | None = typer.Option(None, "--integration-options", help='Options for the target integration'),
+):
+    """Switch from the current integration to a different one."""
+    from .integrations import INTEGRATION_REGISTRY, get_integration
+    from .integrations.manifest import IntegrationManifest
+
+    project_root = _require_specify_project()
+    target_integration = get_integration(target)
+    if target_integration is None:
+        console.print(f"[red]Error:[/red] Unknown integration '{target}'")
+        available = ", ".join(sorted(INTEGRATION_REGISTRY.keys()))
+        console.print(f"Available integrations: {available}")
+        raise typer.Exit(1)
+
+    current = _read_integration_json(project_root)
+    installed_keys = _installed_integration_keys(current)
+    installed_key = _default_integration_key(current)
+
+    if installed_key == target:
+        if integration_options is not None:
+            console.print(
+                "[red]Error:[/red] --integration-options cannot be used when switching "
+                "to an already installed integration."
+            )
+            console.print(
+                f"Run [cyan]specify integration upgrade {target} --integration-options ...[/cyan] "
+                "to update managed files/options."
+            )
+            raise typer.Exit(1)
+        if force:
+            raw_options, parsed_options = _resolve_integration_options(
+                target_integration, current, target, None
+            )
+            _set_default_integration_or_exit(
+                project_root,
+                current,
+                target,
+                target_integration,
+                installed_keys,
+                raw_options=raw_options,
+                parsed_options=parsed_options,
+                refresh_templates_force=True,
+            )
+            console.print(
+                f"\n[green]✓[/green] Default integration remains [bold]{target}[/bold]; "
+                "managed shared templates refreshed."
+            )
+            raise typer.Exit(0)
+        console.print(f"[yellow]Integration '{target}' is already the default integration. Nothing to switch.[/yellow]")
+        raise typer.Exit(0)
+
+    if target in installed_keys:
+        if integration_options is not None:
+            console.print(
+                "[red]Error:[/red] --integration-options cannot be used when switching "
+                "to an already installed integration."
+            )
+            console.print(
+                f"Run [cyan]specify integration upgrade {target} --integration-options ...[/cyan] "
+                f"to update managed files/options, then [cyan]specify integration use {target}[/cyan]."
+            )
+            raise typer.Exit(1)
+        raw_options, parsed_options = _resolve_integration_options(
+            target_integration, current, target, None
+        )
+        _set_default_integration_or_exit(
+            project_root,
+            current,
+            target,
+            target_integration,
+            installed_keys,
+            raw_options=raw_options,
+            parsed_options=parsed_options,
+            refresh_templates_force=force,
+        )
+        console.print(f"\n[green]✓[/green] Default integration set to [bold]{target}[/bold].")
+        raise typer.Exit(0)
+
+    selected_script = _resolve_script_type(project_root, script)
+
+    # Phase 1: Uninstall current integration (if any)
+    if installed_key:
+        current_integration = get_integration(installed_key)
+        manifest_path = project_root / ".specify" / "integrations" / f"{installed_key}.manifest.json"
+
+        if current_integration and manifest_path.exists():
+            console.print(f"Uninstalling current integration: [cyan]{installed_key}[/cyan]")
+            try:
+                old_manifest = IntegrationManifest.load(installed_key, project_root)
+            except _MANIFEST_READ_ERRORS as exc:
+                console.print(f"[red]Error:[/red] Could not read integration manifest for '{installed_key}': {manifest_path}")
+                console.print(f"[dim]{exc}[/dim]")
+                console.print(
+                    f"To recover, delete the unreadable manifest at {manifest_path}, "
+                    f"run [cyan]specify integration uninstall {installed_key}[/cyan], then retry."
+                )
+                raise typer.Exit(1)
+            removed, skipped = old_manifest.uninstall(project_root, force=force)
+            current_integration.remove_context_section(project_root)
+            if removed:
+                console.print(f"  Removed {len(removed)} file(s)")
+            if skipped:
+                console.print(f"  [yellow]⚠[/yellow]  {len(skipped)} modified file(s) preserved")
+        elif not current_integration and manifest_path.exists():
+            # Integration removed from registry but manifest exists — use manifest-only uninstall
+            console.print(f"Uninstalling unknown integration '{installed_key}' via manifest")
+            try:
+                old_manifest = IntegrationManifest.load(installed_key, project_root)
+                removed, skipped = old_manifest.uninstall(project_root, force=force)
+                if removed:
+                    console.print(f"  Removed {len(removed)} file(s)")
+                if skipped:
+                    console.print(f"  [yellow]⚠[/yellow]  {len(skipped)} modified file(s) preserved")
+            except _MANIFEST_READ_ERRORS as exc:
+                console.print(f"[yellow]Warning:[/yellow] Could not read manifest for '{installed_key}': {exc}")
+        else:
+            console.print(f"[red]Error:[/red] Integration '{installed_key}' is installed but has no manifest.")
+            console.print(
+                f"Run [cyan]specify integration uninstall {installed_key}[/cyan] to clear metadata, "
+                f"then retry [cyan]specify integration switch {target}[/cyan]."
+            )
+            raise typer.Exit(1)
+
+        # Unregister extension commands for the old agent so they don't
+        # remain as orphans in the old agent's directory.
+        try:
+            from .extensions import ExtensionManager
+
+            ext_mgr = ExtensionManager(project_root)
+            ext_mgr.unregister_agent_artifacts(installed_key)
+        except Exception as ext_err:
+            _print_cli_warning(
+                "clean up extension artifacts for",
+                "integration",
+                installed_key,
+                ext_err,
+                continuing="Continuing with integration switch; old extension artifacts may need manual cleanup.",
+            )
+
+        # Clear metadata so a failed Phase 2 doesn't leave stale references
+        installed_keys = [installed for installed in installed_keys if installed != installed_key]
+        _clear_init_options_for_integration(project_root, installed_key)
+        if installed_keys:
+            fallback_key = installed_keys[0]
+            fallback_integration = get_integration(fallback_key)
+            if fallback_integration is not None:
+                raw_options, parsed_options = _resolve_integration_options(
+                    fallback_integration, current, fallback_key, None
+                )
+                _set_default_integration_or_exit(
+                    project_root,
+                    current,
+                    fallback_key,
+                    fallback_integration,
+                    installed_keys,
+                    raw_options=raw_options,
+                    parsed_options=parsed_options,
+                )
+            else:
+                _write_integration_json(
+                    project_root, fallback_key, installed_keys, _integration_settings(current)
+                )
+        else:
+            _remove_integration_json(project_root)
+        current = _read_integration_json(project_root)
+
+    # Build parsed options from --integration-options so the integration
+    # can determine its effective invoke separator before shared infra
+    # is installed.
+    raw_options, parsed_options = _resolve_integration_options(
+        target_integration, current, target, integration_options
+    )
+
+    # Refresh shared infrastructure to the current CLI version. Switching
+    # integrations is exactly when stale vendored shared scripts (e.g.
+    # update-agent-context.sh that pre-dates the target integration's
+    # supported-agent list) would silently break the new integration.
+    #
+    # Use refresh_managed=True so only files that match their previously
+    # recorded hash are overwritten — user customizations are detected via
+    # hash divergence and preserved with a warning. Pass
+    # --refresh-shared-infra to overwrite customizations as well. See #2293.
+    _install_shared_infra_or_exit(
+        project_root,
+        selected_script,
+        force=refresh_shared_infra,
+        refresh_managed=True,
+        invoke_separator=_invoke_separator_for_integration(
+            target_integration, current, target, parsed_options
+        ),
+        refresh_hint=(
+            "To overwrite customizations, re-run with "
+            "[cyan]specify integration switch ... --refresh-shared-infra[/cyan]."
+        ),
+    )
+    if os.name != "nt":
+        ensure_executable_scripts(project_root)
+
+    # Phase 2: Install target integration
+    console.print(f"Installing integration: [cyan]{target}[/cyan]")
+    manifest = IntegrationManifest(
+        target_integration.key, project_root, version=get_speckit_version()
+    )
+
+    try:
+        target_integration.setup(
+            project_root, manifest,
+            parsed_options=parsed_options,
+            script_type=selected_script,
+            raw_options=raw_options,
+        )
+        manifest.save()
+        _set_default_integration(
+            project_root,
+            current,
+            target_integration.key,
+            target_integration,
+            _dedupe_integration_keys([*installed_keys, target_integration.key]),
+            script_type=selected_script,
+            raw_options=raw_options,
+            parsed_options=parsed_options,
+        )
+
+        # Re-register extension commands for the new agent so that
+        # previously-installed extensions are available in the new integration.
+        try:
+            from .extensions import ExtensionManager
+
+            ext_mgr = ExtensionManager(project_root)
+            ext_mgr.register_enabled_extensions_for_agent(target)
+        except Exception as ext_err:
+            _print_cli_warning(
+                "register extension artifacts for",
+                "integration",
+                target,
+                ext_err,
+                continuing="The integration switch succeeded, but installed extensions may need re-registration.",
+            )
+
+    except Exception as exc:
+        # Attempt rollback of any files written by setup
+        try:
+            target_integration.teardown(project_root, manifest, force=True)
+        except Exception as rollback_err:
+            # Suppress so the original setup error remains the primary failure
+            _print_cli_warning(
+                "rollback",
+                "integration",
+                target,
+                rollback_err,
+                continuing="The original switch failure is still the primary error.",
+            )
+        if installed_keys:
+            fallback_key = installed_keys[0]
+            fallback_integration = get_integration(fallback_key)
+            if fallback_integration is not None:
+                raw_options, parsed_options = _resolve_integration_options(
+                    fallback_integration, current, fallback_key, None
+                )
+                try:
+                    _set_default_integration(
+                        project_root,
+                        current,
+                        fallback_key,
+                        fallback_integration,
+                        installed_keys,
+                        raw_options=raw_options,
+                        parsed_options=parsed_options,
+                    )
+                except _SharedTemplateRefreshError as restore_err:
+                    console.print(
+                        f"[yellow]Warning:[/yellow] Failed to restore default "
+                        f"integration '{fallback_key}': {restore_err}"
+                    )
+            else:
+                _write_integration_json(
+                    project_root, fallback_key, installed_keys, _integration_settings(current)
+                )
+        else:
+            _remove_integration_json(project_root)
+        console.print(
+            f"[red]Error:[/red] Failed to {_cli_phase_label('install', 'integration', target)} "
+            f"during switch: {_cli_error_detail(exc)}"
+        )
+        raise typer.Exit(1)
+
+    name = (target_integration.config or {}).get("name", target)
+    console.print(f"\n[green]✓[/green] Switched to integration '{name}'")
+
+
+@integration_app.command("upgrade")
+def integration_upgrade(
+    key: str | None = typer.Argument(None, help="Integration key to upgrade (default: current integration)"),
+    force: bool = typer.Option(False, "--force", help="Force upgrade even if files are modified"),
+    script: str | None = typer.Option(None, "--script", help="Script type: sh or ps (default: from init-options.json or platform default)"),
+    integration_options: str | None = typer.Option(None, "--integration-options", help="Options for the integration"),
+):
+    """Upgrade an integration by reinstalling with diff-aware file handling.
+
+    Compares manifest hashes to detect locally modified files and
+    blocks the upgrade unless --force is used.
+    """
+    from .integrations import get_integration
+    from .integrations.manifest import IntegrationManifest
+
+    project_root = _require_specify_project()
+    current = _read_integration_json(project_root)
+    installed_key = _default_integration_key(current)
+    installed_keys = _installed_integration_keys(current)
+
+    if key is None:
+        if not installed_key:
+            console.print("[yellow]No integration is currently installed.[/yellow]")
+            raise typer.Exit(0)
+        key = installed_key
+
+    if key not in installed_keys:
+        console.print(f"[red]Error:[/red] Integration '{key}' is not installed.")
+        raise typer.Exit(1)
+
+    integration = get_integration(key)
+    if integration is None:
+        console.print(f"[red]Error:[/red] Unknown integration '{key}'")
+        raise typer.Exit(1)
+
+    manifest_path = project_root / ".specify" / "integrations" / f"{key}.manifest.json"
+    if not manifest_path.exists():
+        console.print(f"[yellow]No manifest found for integration '{key}'. Nothing to upgrade.[/yellow]")
+        console.print(f"Run [cyan]specify integration install {key}[/cyan] to perform a fresh install.")
+        raise typer.Exit(0)
+
+    try:
+        old_manifest = IntegrationManifest.load(key, project_root)
+    except _MANIFEST_READ_ERRORS as exc:
+        console.print(f"[red]Error:[/red] Integration manifest for '{key}' is unreadable: {exc}")
+        raise typer.Exit(1)
+
+    # Detect modified files via manifest hashes
+    modified = old_manifest.check_modified()
+    if modified and not force:
+        console.print(f"[yellow]⚠[/yellow]  {len(modified)} file(s) have been modified since installation:")
+        for rel in modified:
+            console.print(f"    {rel}")
+        console.print("\nUse [cyan]--force[/cyan] to overwrite modified files, or resolve manually.")
+        raise typer.Exit(1)
+
+    selected_script = _resolve_integration_script_type(project_root, current, key, script)
+
+    # Build parsed options from --integration-options so the integration
+    # can determine its effective invoke separator before shared infra
+    # is installed.
+    raw_options, parsed_options = _resolve_integration_options(
+        integration, current, key, integration_options
+    )
+
+    # Ensure shared infrastructure is up to date; --force overwrites existing files.
+    infra_integration = integration
+    infra_key = key
+    infra_parsed = parsed_options
+    if installed_key and installed_key != key:
+        default_integration = get_integration(installed_key)
+        if default_integration is not None:
+            infra_integration = default_integration
+            infra_key = installed_key
+            _, infra_parsed = _resolve_integration_options(
+                default_integration, current, installed_key, None
+            )
+    _install_shared_infra_or_exit(
+        project_root,
+        selected_script,
+        force=force,
+        invoke_separator=_invoke_separator_for_integration(
+            infra_integration, current, infra_key, infra_parsed
+        ),
+    )
+    if os.name != "nt":
+        ensure_executable_scripts(project_root)
+
+    # Phase 1: Install new files (overwrites existing; old-only files remain)
+    console.print(f"Upgrading integration: [cyan]{key}[/cyan]")
+    new_manifest = IntegrationManifest(key, project_root, version=get_speckit_version())
+
+    try:
+        integration.setup(
+            project_root,
+            new_manifest,
+            parsed_options=parsed_options,
+            script_type=selected_script,
+            raw_options=raw_options,
+        )
+        settings = _with_integration_setting(
+            current,
+            key,
+            integration,
+            script_type=selected_script,
+            raw_options=raw_options,
+            parsed_options=parsed_options,
+        )
+        if installed_key == key:
+            try:
+                _refresh_shared_templates(
+                    project_root,
+                    invoke_separator=_invoke_separator_for_integration(
+                        integration, {"integration_settings": settings}, key, parsed_options
+                    ),
+                    force=force,
+                )
+            except (ValueError, OSError) as exc:
+                raise _SharedTemplateRefreshError(
+                    f"Failed to refresh shared templates for '{key}': {exc}"
+                ) from exc
+        new_manifest.save()
+        _write_integration_json(project_root, installed_key, installed_keys, settings)
+        if installed_key == key:
+            _update_init_options_for_integration(project_root, integration, script_type=selected_script)
+    except Exception as exc:
+        # Don't teardown — setup overwrites in-place, so teardown would
+        # delete files that were working before the upgrade.  Just report.
+        console.print(f"[red]Error:[/red] Failed to {_cli_phase_label('upgrade', 'integration', key)}.")
+        console.print(f"[dim]Details:[/dim] {_cli_error_detail(exc)}")
+        console.print("[yellow]The previous integration files may still be in place.[/yellow]")
+        raise typer.Exit(1)
+
+    # Phase 2: Remove stale files from old manifest that are not in the new one
+    old_files = old_manifest.files
+    new_files = new_manifest.files
+    stale_keys = set(old_files) - set(new_files)
+    if stale_keys:
+        stale_manifest = IntegrationManifest(key, project_root, version="stale-cleanup")
+        stale_manifest._files = {k: old_files[k] for k in stale_keys}
+        stale_removed, _ = stale_manifest.uninstall(project_root, force=True)
+        if stale_removed:
+            console.print(f"  Removed {len(stale_removed)} stale file(s) from previous install")
+
+    name = (integration.config or {}).get("name", key)
+    console.print(f"\n[green]✓[/green] Integration '{name}' upgraded successfully")
+
+
+# ===== Integration catalog discovery commands =====
+#
+# These commands mirror the workflow catalog CLI shape:
+#   - `search` / `info` for discovery over the active catalog stack
+#   - `catalog list/add/remove` for managing catalog sources
+#
+# They deliberately do NOT add `integration add/remove/enable/disable/
+# set-priority`: integrations are single-active (install / uninstall / switch),
+# not additive like extensions and presets.
+
+
+@integration_app.command("search")
+def integration_search(
+    query: Optional[str] = typer.Argument(None, help="Search query (optional)"),
+    tag: Optional[str] = typer.Option(None, "--tag", help="Filter by tag"),
+    author: Optional[str] = typer.Option(None, "--author", help="Filter by author"),
+):
+    """Search for integrations in the active catalog stack."""
+    from .integrations import INTEGRATION_REGISTRY
+    from .integrations.catalog import (
+        IntegrationCatalog,
+        IntegrationCatalogError,
+        IntegrationValidationError,
+    )
+
+    project_root = _require_specify_project()
+    integration_config = _read_integration_json(project_root)
+    installed_key = integration_config.get("integration")
+    catalog = IntegrationCatalog(project_root)
+
+    try:
+        results = catalog.search(query=query, tag=tag, author=author)
+    except IntegrationValidationError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        console.print(
+            "\nTip: Check the configuration file path shown above for invalid catalog configuration "
+            "(for example, .specify/integration-catalogs.yml or ~/.specify/integration-catalogs.yml)."
+        )
+        raise typer.Exit(1)
+    except IntegrationCatalogError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        if os.environ.get("SPECKIT_INTEGRATION_CATALOG_URL", "").strip():
+            console.print(
+                "\nTip: Check the SPECKIT_INTEGRATION_CATALOG_URL environment variable for an invalid "
+                "catalog URL, or unset it to use the configured catalog files "
+                "(.specify/integration-catalogs.yml or ~/.specify/integration-catalogs.yml)."
+            )
+        else:
+            console.print("\nTip: The catalog may be temporarily unavailable. Try again later.")
+        raise typer.Exit(1)
+
+    if not results:
+        console.print("\n[yellow]No integrations found matching criteria[/yellow]")
+        if query or tag or author:
+            console.print("\nTry:")
+            console.print("  • Broader search terms")
+            console.print("  • Remove filters")
+            console.print("  • specify integration search (show all)")
+        return
+
+    console.print(f"\n[green]Found {len(results)} integration(s):[/green]\n")
+    for integ in sorted(results, key=lambda e: e.get("id", "")):
+        iid = integ.get("id", "?")
+        name = integ.get("name", iid)
+        version = integ.get("version", "?")
+        console.print(f"[bold]{name}[/bold] ({iid}) v{version}")
+        desc = integ.get("description", "")
+        if desc:
+            console.print(f"  {desc}")
+
+        console.print(f"\n  [dim]Author:[/dim] {integ.get('author', 'Unknown')}")
+        tags = integ.get("tags", [])
+        if isinstance(tags, list) and tags:
+            console.print(f"  [dim]Tags:[/dim] {', '.join(str(t) for t in tags)}")
+
+        cat_name = integ.get("_catalog_name", "")
+        install_allowed = integ.get("_install_allowed", True)
+        if cat_name:
+            if install_allowed:
+                console.print(f"  [dim]Catalog:[/dim] {cat_name}")
+            else:
+                console.print(
+                    f"  [dim]Catalog:[/dim] {cat_name} "
+                    "[yellow](discovery only — not installable)[/yellow]"
+                )
+
+        if iid == installed_key:
+            console.print("\n  [green]✓ Installed[/green] (currently active)")
+        elif iid in INTEGRATION_REGISTRY:
+            console.print(f"\n  [cyan]Install:[/cyan] specify integration install {iid}")
+        elif install_allowed:
+            console.print(
+                "\n  [yellow]Found in catalog.[/yellow] Only built-in integration IDs "
+                "can be installed with 'specify integration install'."
+            )
+        else:
+            console.print(
+                f"\n  [yellow]⚠[/yellow]  Not directly installable from '{cat_name}'."
+            )
+        console.print()
+
+
+@integration_app.command("info")
+def integration_info(
+    integration_id: str = typer.Argument(..., help="Integration ID"),
+):
+    """Show catalog details for a single integration."""
+    from .integrations import INTEGRATION_REGISTRY
+    from .integrations.catalog import (
+        IntegrationCatalog,
+        IntegrationCatalogError,
+        IntegrationValidationError,
+    )
+
+    project_root = _require_specify_project()
+    catalog = IntegrationCatalog(project_root)
+    installed_key = _read_integration_json(project_root).get("integration")
+
+    try:
+        info = catalog.get_integration_info(integration_id)
+    except IntegrationCatalogError as exc:
+        info = None
+        # Keep the live exception so the fallback branch below can give
+        # different guidance for local-config vs. network failures.
+        catalog_error: Optional[IntegrationCatalogError] = exc
+    else:
+        catalog_error = None
+
+    if info:
+        name = info.get("name", integration_id)
+        version = info.get("version", "?")
+        console.print(f"\n[bold cyan]{name}[/bold cyan] ({integration_id}) v{version}")
+        if info.get("description"):
+            console.print(f"  {info['description']}")
+        console.print()
+
+        console.print(f"  [dim]Author:[/dim] {info.get('author', 'Unknown')}")
+        if info.get("license"):
+            console.print(f"  [dim]License:[/dim] {info['license']}")
+
+        tags = info.get("tags", [])
+        if isinstance(tags, list) and tags:
+            console.print(f"  [dim]Tags:[/dim] {', '.join(str(t) for t in tags)}")
+
+        cat_name = info.get("_catalog_name", "")
+        install_allowed = info.get("_install_allowed", True)
+        if cat_name:
+            install_note = "" if install_allowed else " [yellow](discovery only)[/yellow]"
+            console.print(f"  [dim]Source catalog:[/dim] {cat_name}{install_note}")
+
+        if info.get("repository"):
+            console.print(f"  [dim]Repository:[/dim] {info['repository']}")
+
+        if integration_id == installed_key:
+            console.print("\n  [green]✓ Installed[/green] (currently active)")
+        elif integration_id in INTEGRATION_REGISTRY:
+            console.print("\n  [dim]Built-in integration (not currently active)[/dim]")
+        return
+
+    if integration_id in INTEGRATION_REGISTRY:
+        integration = INTEGRATION_REGISTRY[integration_id]
+        cfg = integration.config or {}
+        name = cfg.get("name", integration_id)
+        console.print(f"\n[bold cyan]{name}[/bold cyan] ({integration_id})")
+        console.print("  [dim]Built-in integration (not listed in catalog)[/dim]")
+        if integration_id == installed_key:
+            console.print("\n  [green]✓ Installed[/green] (currently active)")
+        if catalog_error:
+            console.print(f"\n[yellow]Catalog unavailable:[/yellow] {catalog_error}")
+        return
+
+    if catalog_error:
+        console.print(f"[red]Error:[/red] Could not query integration catalog: {catalog_error}")
+        if isinstance(catalog_error, IntegrationValidationError):
+            console.print(
+                "\nCheck the configuration file path shown above "
+                "(.specify/integration-catalogs.yml or ~/.specify/integration-catalogs.yml), "
+                "or use a built-in integration ID directly."
+            )
+        elif os.environ.get("SPECKIT_INTEGRATION_CATALOG_URL", "").strip():
+            console.print(
+                "\nCheck whether SPECKIT_INTEGRATION_CATALOG_URL is set correctly and reachable, "
+                "or unset it to use the configured catalog files, or use a built-in integration ID directly."
+            )
+        else:
+            console.print("\nTry again when online, or use a built-in integration ID directly.")
+    else:
+        console.print(f"[red]Error:[/red] Integration '{integration_id}' not found")
+        console.print("\nTry: specify integration search")
+    raise typer.Exit(1)
+
+
+@integration_catalog_app.command("list")
+def integration_catalog_list():
+    """List configured integration catalog sources."""
+    from .integrations.catalog import IntegrationCatalog, IntegrationCatalogError
+
+    project_root = _require_specify_project()
+    catalog = IntegrationCatalog(project_root)
+    env_override = os.environ.get("SPECKIT_INTEGRATION_CATALOG_URL", "").strip()
+
+    try:
+        if env_override:
+            project_configs = None
+            configs = catalog.get_catalog_configs()
+        else:
+            project_configs = catalog.get_project_catalog_configs()
+            configs = project_configs if project_configs is not None else catalog.get_catalog_configs()
+    except IntegrationCatalogError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print("\n[bold cyan]Integration Catalog Sources:[/bold cyan]\n")
+    if env_override:
+        console.print(
+            "  SPECKIT_INTEGRATION_CATALOG_URL is set; it supersedes configured catalog files."
+        )
+        console.print(
+            "  Project/user catalog sources are not active while the env override is set.\n"
+        )
+        console.print("[bold]Active catalog source from environment (non-removable here):[/bold]\n")
+    elif project_configs is None:
+        console.print("  No project-level catalog sources configured.\n")
+        console.print("[bold]Active catalog sources (non-removable here):[/bold]\n")
+    else:
+        console.print("[bold]Project catalog sources (removable):[/bold]\n")
+
+    for i, cfg in enumerate(configs):
+        install_status = (
+            "[green]install allowed[/green]"
+            if cfg.get("install_allowed")
+            else "[yellow]discovery only[/yellow]"
+        )
+        raw_name = cfg.get("name")
+        display_name = str(raw_name).strip() if raw_name is not None else ""
+        if not display_name:
+            display_name = f"catalog-{i + 1}"
+        if env_override or project_configs is None:
+            console.print(f"  - [bold]{display_name}[/bold] — {install_status}")
+        else:
+            console.print(f"  [{i}] [bold]{display_name}[/bold] — {install_status}")
+        console.print(f"      {cfg.get('url', '')}")
+        if cfg.get("description"):
+            console.print(f"      [dim]{cfg['description']}[/dim]")
+        console.print()
+
+
+@integration_catalog_app.command("add")
+def integration_catalog_add(
+    url: str = typer.Argument(
+        ...,
+        help=(
+            "Catalog URL to add (HTTPS required, except http://localhost, "
+            "http://127.0.0.1, or http://[::1] for local testing)"
+        ),
+    ),
+    name: Optional[str] = typer.Option(None, "--name", help="Catalog name"),
+):
+    """Add an integration catalog source to the project config."""
+    from .integrations.catalog import IntegrationCatalog, IntegrationCatalogError
+
+    project_root = _require_specify_project()
+    catalog = IntegrationCatalog(project_root)
+
+    # Normalize once here so the success message reflects what was actually
+    # stored. ``IntegrationCatalog.add_catalog`` strips again defensively.
+    normalized_url = url.strip()
+
+    try:
+        catalog.add_catalog(normalized_url, name)
+    except IntegrationCatalogError as exc:
+        # Covers both URL validation (base class) and config-file validation
+        # (IntegrationValidationError subclass).
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓[/green] Catalog source added: {normalized_url}")
+
+
+@integration_catalog_app.command("remove")
+def integration_catalog_remove(
+    index: int = typer.Argument(..., help="Catalog index to remove (from 'catalog list')"),
+):
+    """Remove an integration catalog source by 0-based index."""
+    from .integrations.catalog import IntegrationCatalog, IntegrationCatalogError
+
+    project_root = _require_specify_project()
+    catalog = IntegrationCatalog(project_root)
+
+    try:
+        removed_name = catalog.remove_catalog(index)
+    except IntegrationCatalogError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓[/green] Catalog source '{removed_name}' removed")
+
+
+# ===== Preset Commands =====
+
+
+@preset_app.command("list")
+def preset_list():
+    """List installed presets."""
+    from .presets import PresetManager
+
+    project_root = _require_specify_project()
+    manager = PresetManager(project_root)
+    installed = manager.list_installed()
+
+    if not installed:
+        console.print("[yellow]No presets installed.[/yellow]")
+        console.print("\nInstall a preset with:")
+        console.print("  [cyan]specify preset add <pack-name>[/cyan]")
+        return
+
+    console.print("\n[bold cyan]Installed Presets:[/bold cyan]\n")
+    for pack in installed:
+        status = "[green]enabled[/green]" if pack.get("enabled", True) else "[red]disabled[/red]"
+        pri = pack.get('priority', 10)
+        console.print(f"  [bold]{pack['name']}[/bold] ({pack['id']}) v{pack['version']} — {status} — priority {pri}")
+        console.print(f"    {pack['description']}")
+        if pack.get("tags"):
+            tags_str = ", ".join(pack["tags"])
+            console.print(f"    [dim]Tags: {tags_str}[/dim]")
+        console.print(f"    [dim]Templates: {pack['template_count']}[/dim]")
+        console.print()
+
+
+@preset_app.command("add")
+def preset_add(
+    preset_id: str = typer.Argument(None, help="Preset ID to install from catalog"),
+    from_url: str = typer.Option(None, "--from", help="Install from a URL (ZIP file)"),
+    dev: str = typer.Option(None, "--dev", help="Install from local directory (development mode)"),
+    priority: int = typer.Option(10, "--priority", help="Resolution priority (lower = higher precedence, default 10)"),
+):
+    """Install a preset."""
+    from .presets import (
+        PresetManager,
+        PresetCatalog,
+        PresetError,
+        PresetValidationError,
+        PresetCompatibilityError,
+    )
+
+    project_root = _require_specify_project()
+    # Validate priority
+    if priority < 1:
+        console.print("[red]Error:[/red] Priority must be a positive integer (1 or higher)")
+        raise typer.Exit(1)
+
+    manager = PresetManager(project_root)
+    speckit_version = get_speckit_version()
+
+    try:
+        if dev:
+            dev_path = Path(dev).resolve()
+            if not dev_path.exists():
+                console.print(f"[red]Error:[/red] Directory not found: {dev}")
+                raise typer.Exit(1)
+
+            console.print(f"Installing preset from [cyan]{dev_path}[/cyan]...")
+            manifest = manager.install_from_directory(dev_path, speckit_version, priority)
+            console.print(f"[green]✓[/green] Preset '{manifest.name}' v{manifest.version} installed (priority {priority})")
+
+        elif from_url:
+            # Validate URL scheme before downloading
+            from urllib.parse import urlparse as _urlparse
+            _parsed = _urlparse(from_url)
+            _is_localhost = _parsed.hostname in ("localhost", "127.0.0.1", "::1")
+            if _parsed.scheme != "https" and not (_parsed.scheme == "http" and _is_localhost):
+                console.print(f"[red]Error:[/red] URL must use HTTPS (got {_parsed.scheme}://). HTTP is only allowed for localhost.")
+                raise typer.Exit(1)
+
+            console.print(f"Installing preset from [cyan]{from_url}[/cyan]...")
+            import urllib.request
+            import urllib.error
+            import tempfile
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zip_path = Path(tmpdir) / "preset.zip"
+                try:
+                    from specify_cli.authentication.http import open_url as _open_url
+
+                    with _open_url(from_url, timeout=60) as response:
+                        zip_path.write_bytes(response.read())
+                except urllib.error.URLError as e:
+                    console.print(f"[red]Error:[/red] Failed to download: {e}")
+                    raise typer.Exit(1)
+
+                manifest = manager.install_from_zip(zip_path, speckit_version, priority)
+
+            console.print(f"[green]✓[/green] Preset '{manifest.name}' v{manifest.version} installed (priority {priority})")
+
+        elif preset_id:
+            # Try bundled preset first, then catalog
+            bundled_path = _locate_bundled_preset(preset_id)
+            if bundled_path:
+                console.print(f"Installing bundled preset [cyan]{preset_id}[/cyan]...")
+                manifest = manager.install_from_directory(bundled_path, speckit_version, priority)
+                console.print(f"[green]✓[/green] Preset '{manifest.name}' v{manifest.version} installed (priority {priority})")
+            else:
+                catalog = PresetCatalog(project_root)
+                pack_info = catalog.get_pack_info(preset_id)
+
+                if not pack_info:
+                    console.print(f"[red]Error:[/red] Preset '{preset_id}' not found in catalog")
+                    raise typer.Exit(1)
+
+                # Bundled presets should have been caught above; if we reach
+                # here the bundled files are missing from the installation.
+                if pack_info.get("bundled") and not pack_info.get("download_url"):
+                    from .extensions import REINSTALL_COMMAND
+                    console.print(
+                        f"[red]Error:[/red] Preset '{preset_id}' is bundled with spec-kit "
+                        f"but could not be found in the installed package."
+                    )
+                    console.print(
+                        "\nThis usually means the spec-kit installation is incomplete or corrupted."
+                    )
+                    console.print("Try reinstalling spec-kit:")
+                    console.print(f"  {REINSTALL_COMMAND}")
+                    raise typer.Exit(1)
+
+                if not pack_info.get("_install_allowed", True):
+                    catalog_name = pack_info.get("_catalog_name", "unknown")
+                    console.print(f"[red]Error:[/red] Preset '{preset_id}' is from the '{catalog_name}' catalog which is discovery-only (install not allowed).")
+                    console.print("Add the catalog with --install-allowed or install from the preset's repository directly with --from.")
+                    raise typer.Exit(1)
+
+                console.print(f"Installing preset [cyan]{pack_info.get('name', preset_id)}[/cyan]...")
+
+                try:
+                    zip_path = catalog.download_pack(preset_id)
+                    manifest = manager.install_from_zip(zip_path, speckit_version, priority)
+                    console.print(f"[green]✓[/green] Preset '{manifest.name}' v{manifest.version} installed (priority {priority})")
+                finally:
+                    if 'zip_path' in locals() and zip_path.exists():
+                        zip_path.unlink(missing_ok=True)
+        else:
+            console.print("[red]Error:[/red] Specify a preset ID, --from URL, or --dev path")
+            raise typer.Exit(1)
+
+    except PresetCompatibilityError as e:
+        console.print(f"[red]Compatibility Error:[/red] {e}")
+        raise typer.Exit(1)
+    except PresetValidationError as e:
+        console.print(f"[red]Validation Error:[/red] {e}")
+        raise typer.Exit(1)
+    except PresetError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+@preset_app.command("remove")
+def preset_remove(
+    preset_id: str = typer.Argument(..., help="Preset ID to remove"),
+):
+    """Remove an installed preset."""
+    from .presets import PresetManager
+
+    project_root = _require_specify_project()
+    manager = PresetManager(project_root)
+
+    if not manager.registry.is_installed(preset_id):
+        console.print(f"[red]Error:[/red] Preset '{preset_id}' is not installed")
+        raise typer.Exit(1)
+
+    if manager.remove(preset_id):
+        console.print(f"[green]✓[/green] Preset '{preset_id}' removed successfully")
+    else:
+        console.print(f"[red]Error:[/red] Failed to remove preset '{preset_id}'")
+        raise typer.Exit(1)
+
+
+@preset_app.command("search")
+def preset_search(
+    query: str = typer.Argument(None, help="Search query"),
+    tag: str = typer.Option(None, "--tag", help="Filter by tag"),
+    author: str = typer.Option(None, "--author", help="Filter by author"),
+):
+    """Search for presets in the catalog."""
+    from .presets import PresetCatalog, PresetError
+
+    project_root = _require_specify_project()
+    catalog = PresetCatalog(project_root)
+
+    try:
+        results = catalog.search(query=query, tag=tag, author=author)
+    except PresetError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    if not results:
+        console.print("[yellow]No presets found matching your criteria.[/yellow]")
+        return
+
+    console.print(f"\n[bold cyan]Presets ({len(results)} found):[/bold cyan]\n")
+    for pack in results:
+        console.print(f"  [bold]{pack.get('name', pack['id'])}[/bold] ({pack['id']}) v{pack.get('version', '?')}")
+        console.print(f"    {pack.get('description', '')}")
+        if pack.get("tags"):
+            tags_str = ", ".join(pack["tags"])
+            console.print(f"    [dim]Tags: {tags_str}[/dim]")
+        console.print()
+
+
+@preset_app.command("resolve")
+def preset_resolve(
+    template_name: str = typer.Argument(..., help="Template name to resolve (e.g., spec-template)"),
+):
+    """Show which template will be resolved for a given name."""
+    from .presets import PresetResolver
+
+    project_root = _require_specify_project()
+    resolver = PresetResolver(project_root)
+    layers = resolver.collect_all_layers(template_name)
+
+    if layers:
+        # Use the highest-priority layer for display because the final output
+        # may be composed and may not map to resolve_with_source()'s single path.
+        display_layer = layers[0]
+        console.print(f"  [bold]{template_name}[/bold]: {display_layer['path']}")
+        console.print(f"    [dim](top layer from: {display_layer['source']})[/dim]")
+
+        has_composition = (
+            layers[0]["strategy"] != "replace"
+            and any(layer["strategy"] != "replace" for layer in layers)
+        )
+        if has_composition:
+            # Verify composition is actually possible
+            try:
+                composed = resolver.resolve_content(template_name)
+            except Exception as exc:
+                composed = None
+                console.print(f"    [yellow]Warning: composition error: {exc}[/yellow]")
+            if composed is None:
+                console.print("    [yellow]Warning: composition cannot produce output (no base layer with 'replace' strategy)[/yellow]")
+            else:
+                console.print("    [dim]Final output is composed from multiple preset layers; the path above is the highest-priority contributing layer.[/dim]")
+            console.print("\n  [bold]Composition chain:[/bold]")
+            # Compute the effective base: first replace layer scanning from
+            # highest priority (matching resolve_content top-down logic).
+            # Only show layers from the base upward (lower layers are ignored).
+            effective_base_idx = None
+            for idx, lyr in enumerate(layers):
+                if lyr["strategy"] == "replace":
+                    effective_base_idx = idx
+                    break
+            # Show only contributing layers (base and above)
+            if effective_base_idx is not None:
+                contributing = layers[:effective_base_idx + 1]
+            else:
+                contributing = layers
+            for i, layer in enumerate(reversed(contributing)):
+                strategy_label = layer["strategy"]
+                if strategy_label == "replace" and i == 0:
+                    strategy_label = "base"
+                console.print(f"    {i + 1}. [{strategy_label}] {layer['source']} → {layer['path']}")
+    else:
+        # No layers found — fall back to resolve_with_source for non-composition cases
+        result = resolver.resolve_with_source(template_name)
+        if result:
+            console.print(f"  [bold]{template_name}[/bold]: {result['path']}")
+            console.print(f"    [dim](from: {result['source']})[/dim]")
+        else:
+            console.print(f"  [yellow]{template_name}[/yellow]: not found")
+            console.print("    [dim]No template with this name exists in the resolution stack[/dim]")
+
+
+@preset_app.command("info")
+def preset_info(
+    preset_id: str = typer.Argument(..., help="Preset ID to get info about"),
+):
+    """Show detailed information about a preset."""
+    from .extensions import normalize_priority
+    from .presets import PresetCatalog, PresetManager, PresetError
+
+    project_root = _require_specify_project()
+    # Check if installed locally first
+    manager = PresetManager(project_root)
+    local_pack = manager.get_pack(preset_id)
+
+    if local_pack:
+        console.print(f"\n[bold cyan]Preset: {local_pack.name}[/bold cyan]\n")
+        console.print(f"  ID:          {local_pack.id}")
+        console.print(f"  Version:     {local_pack.version}")
+        console.print(f"  Description: {local_pack.description}")
+        if local_pack.author:
+            console.print(f"  Author:      {local_pack.author}")
+        if local_pack.tags:
+            console.print(f"  Tags:        {', '.join(local_pack.tags)}")
+        console.print(f"  Templates:   {len(local_pack.templates)}")
+        for tmpl in local_pack.templates:
+            console.print(f"    - {tmpl['name']} ({tmpl['type']}): {tmpl.get('description', '')}")
+        repo = local_pack.data.get("preset", {}).get("repository")
+        if repo:
+            console.print(f"  Repository:  {repo}")
+        license_val = local_pack.data.get("preset", {}).get("license")
+        if license_val:
+            console.print(f"  License:     {license_val}")
+        console.print("\n  [green]Status: installed[/green]")
+        # Get priority from registry
+        pack_metadata = manager.registry.get(preset_id)
+        priority = normalize_priority(pack_metadata.get("priority") if isinstance(pack_metadata, dict) else None)
+        console.print(f"  [dim]Priority:[/dim] {priority}")
+        console.print()
+        return
+
+    # Fall back to catalog
+    catalog = PresetCatalog(project_root)
+    try:
+        pack_info = catalog.get_pack_info(preset_id)
+    except PresetError:
+        pack_info = None
+
+    if not pack_info:
+        console.print(f"[red]Error:[/red] Preset '{preset_id}' not found (not installed and not in catalog)")
+        raise typer.Exit(1)
+
+    console.print(f"\n[bold cyan]Preset: {pack_info.get('name', preset_id)}[/bold cyan]\n")
+    console.print(f"  ID:          {pack_info['id']}")
+    console.print(f"  Version:     {pack_info.get('version', '?')}")
+    console.print(f"  Description: {pack_info.get('description', '')}")
+    if pack_info.get("author"):
+        console.print(f"  Author:      {pack_info['author']}")
+    if pack_info.get("tags"):
+        console.print(f"  Tags:        {', '.join(pack_info['tags'])}")
+    if pack_info.get("repository"):
+        console.print(f"  Repository:  {pack_info['repository']}")
+    if pack_info.get("license"):
+        console.print(f"  License:     {pack_info['license']}")
+    console.print("\n  [yellow]Status: not installed[/yellow]")
+    console.print(f"  Install with: [cyan]specify preset add {preset_id}[/cyan]")
+    console.print()
+
+
+@preset_app.command("set-priority")
+def preset_set_priority(
+    preset_id: str = typer.Argument(help="Preset ID"),
+    priority: int = typer.Argument(help="New priority (lower = higher precedence)"),
+):
+    """Set the resolution priority of an installed preset."""
+    from .presets import PresetManager
+
+    project_root = _require_specify_project()
+    # Validate priority
+    if priority < 1:
+        console.print("[red]Error:[/red] Priority must be a positive integer (1 or higher)")
+        raise typer.Exit(1)
+
+    manager = PresetManager(project_root)
+
+    # Check if preset is installed
+    if not manager.registry.is_installed(preset_id):
+        console.print(f"[red]Error:[/red] Preset '{preset_id}' is not installed")
+        raise typer.Exit(1)
+
+    # Get current metadata
+    metadata = manager.registry.get(preset_id)
+    if metadata is None or not isinstance(metadata, dict):
+        console.print(f"[red]Error:[/red] Preset '{preset_id}' not found in registry (corrupted state)")
+        raise typer.Exit(1)
+
+    from .extensions import normalize_priority
+    raw_priority = metadata.get("priority")
+    # Only skip if the stored value is already a valid int equal to requested priority
+    # This ensures corrupted values (e.g., "high") get repaired even when setting to default (10)
+    if isinstance(raw_priority, int) and raw_priority == priority:
+        console.print(f"[yellow]Preset '{preset_id}' already has priority {priority}[/yellow]")
+        raise typer.Exit(0)
+
+    old_priority = normalize_priority(raw_priority)
+
+    # Update priority
+    manager.registry.update(preset_id, {"priority": priority})
+
+    console.print(f"[green]✓[/green] Preset '{preset_id}' priority changed: {old_priority} → {priority}")
+    console.print("\n[dim]Lower priority = higher precedence in template resolution[/dim]")
+
+
+@preset_app.command("enable")
+def preset_enable(
+    preset_id: str = typer.Argument(help="Preset ID to enable"),
+):
+    """Enable a disabled preset."""
+    from .presets import PresetManager
+
+    project_root = _require_specify_project()
+    manager = PresetManager(project_root)
+
+    # Check if preset is installed
+    if not manager.registry.is_installed(preset_id):
+        console.print(f"[red]Error:[/red] Preset '{preset_id}' is not installed")
+        raise typer.Exit(1)
+
+    # Get current metadata
+    metadata = manager.registry.get(preset_id)
+    if metadata is None or not isinstance(metadata, dict):
+        console.print(f"[red]Error:[/red] Preset '{preset_id}' not found in registry (corrupted state)")
+        raise typer.Exit(1)
+
+    if metadata.get("enabled", True):
+        console.print(f"[yellow]Preset '{preset_id}' is already enabled[/yellow]")
+        raise typer.Exit(0)
+
+    # Enable the preset
+    manager.registry.update(preset_id, {"enabled": True})
+
+    console.print(f"[green]✓[/green] Preset '{preset_id}' enabled")
+    console.print("\nTemplates from this preset will now be included in resolution.")
+    console.print("[dim]Note: Previously registered commands/skills remain active.[/dim]")
+
+
+@preset_app.command("disable")
+def preset_disable(
+    preset_id: str = typer.Argument(help="Preset ID to disable"),
+):
+    """Disable a preset without removing it."""
+    from .presets import PresetManager
+
+    project_root = _require_specify_project()
+    manager = PresetManager(project_root)
+
+    # Check if preset is installed
+    if not manager.registry.is_installed(preset_id):
+        console.print(f"[red]Error:[/red] Preset '{preset_id}' is not installed")
+        raise typer.Exit(1)
+
+    # Get current metadata
+    metadata = manager.registry.get(preset_id)
+    if metadata is None or not isinstance(metadata, dict):
+        console.print(f"[red]Error:[/red] Preset '{preset_id}' not found in registry (corrupted state)")
+        raise typer.Exit(1)
+
+    if not metadata.get("enabled", True):
+        console.print(f"[yellow]Preset '{preset_id}' is already disabled[/yellow]")
+        raise typer.Exit(0)
+
+    # Disable the preset
+    manager.registry.update(preset_id, {"enabled": False})
+
+    console.print(f"[green]✓[/green] Preset '{preset_id}' disabled")
+    console.print("\nTemplates from this preset will be skipped during resolution.")
+    console.print("[dim]Note: Previously registered commands/skills remain active until preset removal.[/dim]")
+    console.print(f"To re-enable: specify preset enable {preset_id}")
+
+
+# ===== Preset Catalog Commands =====
+
+
+@preset_catalog_app.command("list")
+def preset_catalog_list():
+    """List all active preset catalogs."""
+    from .presets import PresetCatalog, PresetValidationError
+
+    project_root = _require_specify_project()
+    catalog = PresetCatalog(project_root)
+
+    try:
+        active_catalogs = catalog.get_active_catalogs()
+    except PresetValidationError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print("\n[bold cyan]Active Preset Catalogs:[/bold cyan]\n")
+    for entry in active_catalogs:
+        install_str = (
+            "[green]install allowed[/green]"
+            if entry.install_allowed
+            else "[yellow]discovery only[/yellow]"
+        )
+        console.print(f"  [bold]{entry.name}[/bold] (priority {entry.priority})")
+        if entry.description:
+            console.print(f"     {entry.description}")
+        console.print(f"     URL: {entry.url}")
+        console.print(f"     Install: {install_str}")
+        console.print()
+
+    config_path = project_root / ".specify" / "preset-catalogs.yml"
+    user_config_path = Path.home() / ".specify" / "preset-catalogs.yml"
+    if os.environ.get("SPECKIT_PRESET_CATALOG_URL"):
+        console.print("[dim]Catalog configured via SPECKIT_PRESET_CATALOG_URL environment variable.[/dim]")
+    else:
+        try:
+            proj_loaded = config_path.exists() and catalog._load_catalog_config(config_path) is not None
+        except PresetValidationError:
+            proj_loaded = False
+        if proj_loaded:
+            console.print(f"[dim]Config: {_display_project_path(project_root, config_path)}[/dim]")
+        else:
+            try:
+                user_loaded = user_config_path.exists() and catalog._load_catalog_config(user_config_path) is not None
+            except PresetValidationError:
+                user_loaded = False
+            if user_loaded:
+                console.print("[dim]Config: ~/.specify/preset-catalogs.yml[/dim]")
+            else:
+                console.print("[dim]Using built-in default catalog stack.[/dim]")
+                console.print(
+                    "[dim]Add .specify/preset-catalogs.yml to customize.[/dim]"
+                )
+
+
+@preset_catalog_app.command("add")
+def preset_catalog_add(
+    url: str = typer.Argument(help="Catalog URL (must use HTTPS)"),
+    name: str = typer.Option(..., "--name", help="Catalog name"),
+    priority: int = typer.Option(10, "--priority", help="Priority (lower = higher priority)"),
+    install_allowed: bool = typer.Option(
+        False, "--install-allowed/--no-install-allowed",
+        help="Allow presets from this catalog to be installed",
+    ),
+    description: str = typer.Option("", "--description", help="Description of the catalog"),
+):
+    """Add a catalog to .specify/preset-catalogs.yml."""
+    from .presets import PresetCatalog, PresetValidationError
+
+    project_root = _require_specify_project()
+    specify_dir = project_root / ".specify"
+
+    # Validate URL
+    tmp_catalog = PresetCatalog(project_root)
+    try:
+        tmp_catalog._validate_catalog_url(url)
+    except PresetValidationError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+    config_path = specify_dir / "preset-catalogs.yml"
+
+    # Load existing config
+    if config_path.exists():
+        try:
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            config_label = _display_project_path(project_root, config_path)
+            console.print(f"[red]Error:[/red] Failed to read {config_label}: {e}")
+            raise typer.Exit(1)
+    else:
+        config = {}
+
+    catalogs = config.get("catalogs", [])
+    if not isinstance(catalogs, list):
+        console.print("[red]Error:[/red] Invalid catalog config: 'catalogs' must be a list.")
+        raise typer.Exit(1)
+
+    # Check for duplicate name
+    for existing in catalogs:
+        if isinstance(existing, dict) and existing.get("name") == name:
+            console.print(f"[yellow]Warning:[/yellow] A catalog named '{name}' already exists.")
+            console.print("Use 'specify preset catalog remove' first, or choose a different name.")
+            raise typer.Exit(1)
+
+    catalogs.append({
+        "name": name,
+        "url": url,
+        "priority": priority,
+        "install_allowed": install_allowed,
+        "description": description,
+    })
+
+    config["catalogs"] = catalogs
+    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+    install_label = "install allowed" if install_allowed else "discovery only"
+    console.print(f"\n[green]✓[/green] Added catalog '[bold]{name}[/bold]' ({install_label})")
+    console.print(f"  URL: {url}")
+    console.print(f"  Priority: {priority}")
+    console.print(f"\nConfig saved to {_display_project_path(project_root, config_path)}")
+
+
+@preset_catalog_app.command("remove")
+def preset_catalog_remove(
+    name: str = typer.Argument(help="Catalog name to remove"),
+):
+    """Remove a catalog from .specify/preset-catalogs.yml."""
+    project_root = _require_specify_project()
+    specify_dir = project_root / ".specify"
+
+    config_path = specify_dir / "preset-catalogs.yml"
+    if not config_path.exists():
+        console.print("[red]Error:[/red] No preset catalog config found. Nothing to remove.")
+        raise typer.Exit(1)
+
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        console.print("[red]Error:[/red] Failed to read preset catalog config.")
+        raise typer.Exit(1)
+
+    catalogs = config.get("catalogs", [])
+    if not isinstance(catalogs, list):
+        console.print("[red]Error:[/red] Invalid catalog config: 'catalogs' must be a list.")
+        raise typer.Exit(1)
+    original_count = len(catalogs)
+    catalogs = [c for c in catalogs if isinstance(c, dict) and c.get("name") != name]
+
+    if len(catalogs) == original_count:
+        console.print(f"[red]Error:[/red] Catalog '{name}' not found.")
+        raise typer.Exit(1)
+
+    config["catalogs"] = catalogs
+    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+    console.print(f"[green]✓[/green] Removed catalog '{name}'")
+    if not catalogs:
+        console.print("\n[dim]No catalogs remain in config. Built-in defaults will be used.[/dim]")
+
+
+# ===== Extension Commands =====
 
 
 def _resolve_installed_extension(
@@ -1976,15 +3472,7 @@ def extension_list(
     """List installed extensions."""
     from .extensions import ExtensionManager
 
-    project_root = Path.cwd()
-
-    # Check if we're in a spec-kit project
-    specify_dir = project_root / ".specify"
-    if not specify_dir.exists():
-        console.print("[red]Error:[/red] Not a spec-kit project (no .specify/ directory)")
-        console.print("Run this command from a spec-kit project root")
-        raise typer.Exit(1)
-
+    project_root = _require_specify_project()
     manager = ExtensionManager(project_root)
     installed = manager.list_installed()
 
@@ -2002,8 +3490,9 @@ def extension_list(
             status_color = "green" if ext["enabled"] else "red"
 
             console.print(f"  [{status_color}]{status_icon}[/{status_color}] [bold]{ext['name']}[/bold] (v{ext['version']})")
+            console.print(f"     [dim]{ext['id']}[/dim]")
             console.print(f"     {ext['description']}")
-            console.print(f"     Commands: {ext['command_count']} | Hooks: {ext['hook_count']} | Status: {'Enabled' if ext['enabled'] else 'Disabled'}")
+            console.print(f"     Commands: {ext['command_count']} | Hooks: {ext['hook_count']} | Priority: {ext['priority']} | Status: {'Enabled' if ext['enabled'] else 'Disabled'}")
             console.print()
 
     if available or all_extensions:
@@ -2016,14 +3505,7 @@ def catalog_list():
     """List all active extension catalogs."""
     from .extensions import ExtensionCatalog, ValidationError
 
-    project_root = Path.cwd()
-
-    specify_dir = project_root / ".specify"
-    if not specify_dir.exists():
-        console.print("[red]Error:[/red] Not a spec-kit project (no .specify/ directory)")
-        console.print("Run this command from a spec-kit project root")
-        raise typer.Exit(1)
-
+    project_root = _require_specify_project()
     catalog = ExtensionCatalog(project_root)
 
     try:
@@ -2056,7 +3538,7 @@ def catalog_list():
         except ValidationError:
             proj_loaded = False
         if proj_loaded:
-            console.print(f"[dim]Config: {config_path.relative_to(project_root)}[/dim]")
+            console.print(f"[dim]Config: {_display_project_path(project_root, config_path)}[/dim]")
         else:
             try:
                 user_loaded = user_config_path.exists() and catalog._load_catalog_config(user_config_path) is not None
@@ -2085,13 +3567,8 @@ def catalog_add(
     """Add a catalog to .specify/extension-catalogs.yml."""
     from .extensions import ExtensionCatalog, ValidationError
 
-    project_root = Path.cwd()
-
+    project_root = _require_specify_project()
     specify_dir = project_root / ".specify"
-    if not specify_dir.exists():
-        console.print("[red]Error:[/red] Not a spec-kit project (no .specify/ directory)")
-        console.print("Run this command from a spec-kit project root")
-        raise typer.Exit(1)
 
     # Validate URL
     tmp_catalog = ExtensionCatalog(project_root)
@@ -2106,9 +3583,10 @@ def catalog_add(
     # Load existing config
     if config_path.exists():
         try:
-            config = yaml.safe_load(config_path.read_text()) or {}
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         except Exception as e:
-            console.print(f"[red]Error:[/red] Failed to read {config_path}: {e}")
+            config_label = _display_project_path(project_root, config_path)
+            console.print(f"[red]Error:[/red] Failed to read {config_label}: {e}")
             raise typer.Exit(1)
     else:
         config = {}
@@ -2134,13 +3612,13 @@ def catalog_add(
     })
 
     config["catalogs"] = catalogs
-    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
     install_label = "install allowed" if install_allowed else "discovery only"
     console.print(f"\n[green]✓[/green] Added catalog '[bold]{name}[/bold]' ({install_label})")
     console.print(f"  URL: {url}")
     console.print(f"  Priority: {priority}")
-    console.print(f"\nConfig saved to {config_path.relative_to(project_root)}")
+    console.print(f"\nConfig saved to {_display_project_path(project_root, config_path)}")
 
 
 @catalog_app.command("remove")
@@ -2148,13 +3626,8 @@ def catalog_remove(
     name: str = typer.Argument(help="Catalog name to remove"),
 ):
     """Remove a catalog from .specify/extension-catalogs.yml."""
-    project_root = Path.cwd()
-
+    project_root = _require_specify_project()
     specify_dir = project_root / ".specify"
-    if not specify_dir.exists():
-        console.print("[red]Error:[/red] Not a spec-kit project (no .specify/ directory)")
-        console.print("Run this command from a spec-kit project root")
-        raise typer.Exit(1)
 
     config_path = specify_dir / "extension-catalogs.yml"
     if not config_path.exists():
@@ -2162,7 +3635,7 @@ def catalog_remove(
         raise typer.Exit(1)
 
     try:
-        config = yaml.safe_load(config_path.read_text()) or {}
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except Exception:
         console.print("[red]Error:[/red] Failed to read catalog config.")
         raise typer.Exit(1)
@@ -2179,7 +3652,7 @@ def catalog_remove(
         raise typer.Exit(1)
 
     config["catalogs"] = catalogs
-    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
     console.print(f"[green]✓[/green] Removed catalog '{name}'")
     if not catalogs:
@@ -2191,17 +3664,15 @@ def extension_add(
     extension: str = typer.Argument(help="Extension name or path"),
     dev: bool = typer.Option(False, "--dev", help="Install from local directory"),
     from_url: Optional[str] = typer.Option(None, "--from", help="Install from custom URL"),
+    priority: int = typer.Option(10, "--priority", help="Resolution priority (lower = higher precedence, default 10)"),
 ):
     """Install an extension."""
-    from .extensions import ExtensionManager, ExtensionCatalog, ExtensionError, ValidationError, CompatibilityError
+    from .extensions import ExtensionManager, ExtensionCatalog, ExtensionError, ValidationError, CompatibilityError, REINSTALL_COMMAND
 
-    project_root = Path.cwd()
-
-    # Check if we're in a spec-kit project
-    specify_dir = project_root / ".specify"
-    if not specify_dir.exists():
-        console.print("[red]Error:[/red] Not a spec-kit project (no .specify/ directory)")
-        console.print("Run this command from a spec-kit project root")
+    project_root = _require_specify_project()
+    # Validate priority
+    if priority < 1:
+        console.print("[red]Error:[/red] Priority must be a positive integer (1 or higher)")
         raise typer.Exit(1)
 
     manager = ExtensionManager(project_root)
@@ -2220,7 +3691,7 @@ def extension_add(
                     console.print(f"[red]Error:[/red] No extension.yml found in {source_path}")
                     raise typer.Exit(1)
 
-                manifest = manager.install_from_directory(source_path, speckit_version)
+                manifest = manager.install_from_directory(source_path, speckit_version, priority=priority)
 
             elif from_url:
                 # Install from URL (ZIP file)
@@ -2248,12 +3719,14 @@ def extension_add(
                 zip_path = download_dir / f"{extension}-url-download.zip"
 
                 try:
-                    with urllib.request.urlopen(from_url, timeout=60) as response:
+                    from specify_cli.authentication.http import open_url as _open_url
+
+                    with _open_url(from_url, timeout=60) as response:
                         zip_data = response.read()
                     zip_path.write_bytes(zip_data)
 
                     # Install from downloaded ZIP
-                    manifest = manager.install_from_zip(zip_path, speckit_version)
+                    manifest = manager.install_from_zip(zip_path, speckit_version, priority=priority)
                 except urllib.error.URLError as e:
                     console.print(f"[red]Error:[/red] Failed to download from {from_url}: {e}")
                     raise typer.Exit(1)
@@ -2263,52 +3736,91 @@ def extension_add(
                         zip_path.unlink()
 
             else:
-                # Install from catalog
-                catalog = ExtensionCatalog(project_root)
+                # Try bundled extensions first (shipped with spec-kit)
+                bundled_path = _locate_bundled_extension(extension)
+                if bundled_path is not None:
+                    manifest = manager.install_from_directory(bundled_path, speckit_version, priority=priority)
+                else:
+                    # Install from catalog (also resolves display names to IDs)
+                    catalog = ExtensionCatalog(project_root)
 
-                # Check if extension exists in catalog (supports both ID and display name)
-                ext_info, catalog_error = _resolve_catalog_extension(extension, catalog, "add")
-                if catalog_error:
-                    console.print(f"[red]Error:[/red] Could not query extension catalog: {catalog_error}")
-                    raise typer.Exit(1)
-                if not ext_info:
-                    console.print(f"[red]Error:[/red] Extension '{extension}' not found in catalog")
-                    console.print("\nSearch available extensions:")
-                    console.print("  specify extension search")
-                    raise typer.Exit(1)
+                    # Check if extension exists in catalog (supports both ID and display name)
+                    ext_info, catalog_error = _resolve_catalog_extension(extension, catalog, "add")
+                    if catalog_error:
+                        console.print(f"[red]Error:[/red] Could not query extension catalog: {catalog_error}")
+                        raise typer.Exit(1)
+                    if not ext_info:
+                        console.print(f"[red]Error:[/red] Extension '{extension}' not found in catalog")
+                        console.print("\nSearch available extensions:")
+                        console.print("  specify extension search")
+                        raise typer.Exit(1)
 
-                # Enforce install_allowed policy
-                if not ext_info.get("_install_allowed", True):
-                    catalog_name = ext_info.get("_catalog_name", "community")
-                    console.print(
-                        f"[red]Error:[/red] '{extension}' is available in the "
-                        f"'{catalog_name}' catalog but installation is not allowed from that catalog."
-                    )
-                    console.print(
-                        f"\nTo enable installation, add '{extension}' to an approved catalog "
-                        f"(install_allowed: true) in .specify/extension-catalogs.yml."
-                    )
-                    raise typer.Exit(1)
+                    # If catalog resolved a display name to an ID, check bundled again
+                    resolved_id = ext_info['id']
+                    if resolved_id != extension:
+                        bundled_path = _locate_bundled_extension(resolved_id)
+                        if bundled_path is not None:
+                            manifest = manager.install_from_directory(bundled_path, speckit_version, priority=priority)
 
-                # Download extension ZIP (use resolved ID, not original argument which may be display name)
-                extension_id = ext_info['id']
-                console.print(f"Downloading {ext_info['name']} v{ext_info.get('version', 'unknown')}...")
-                zip_path = catalog.download_extension(extension_id)
+                    if bundled_path is None:
+                        # Bundled extensions without a download URL must come from the local package
+                        if ext_info.get("bundled") and not ext_info.get("download_url"):
+                            console.print(
+                                f"[red]Error:[/red] Extension '{ext_info['id']}' is bundled with spec-kit "
+                                f"but could not be found in the installed package."
+                            )
+                            console.print(
+                                "\nThis usually means the spec-kit installation is incomplete or corrupted."
+                            )
+                            console.print("Try reinstalling spec-kit:")
+                            console.print(f"  {REINSTALL_COMMAND}")
+                            raise typer.Exit(1)
 
-                try:
-                    # Install from downloaded ZIP
-                    manifest = manager.install_from_zip(zip_path, speckit_version)
-                finally:
-                    # Clean up downloaded ZIP
-                    if zip_path.exists():
-                        zip_path.unlink()
+                        # Enforce install_allowed policy
+                        if not ext_info.get("_install_allowed", True):
+                            catalog_name = ext_info.get("_catalog_name", "community")
+                            console.print(
+                                f"[red]Error:[/red] '{extension}' is available in the "
+                                f"'{catalog_name}' catalog but installation is not allowed from that catalog."
+                            )
+                            console.print(
+                                f"\nTo enable installation, add '{extension}' to an approved catalog "
+                                f"(install_allowed: true) in .specify/extension-catalogs.yml."
+                            )
+                            raise typer.Exit(1)
+
+                        # Download extension ZIP (use resolved ID, not original argument which may be display name)
+                        extension_id = ext_info['id']
+                        console.print(f"Downloading {ext_info['name']} v{ext_info.get('version', 'unknown')}...")
+                        zip_path = catalog.download_extension(extension_id)
+
+                        try:
+                            # Install from downloaded ZIP
+                            manifest = manager.install_from_zip(zip_path, speckit_version, priority=priority)
+                        finally:
+                            # Clean up downloaded ZIP
+                            if zip_path.exists():
+                                zip_path.unlink()
 
         console.print("\n[green]✓[/green] Extension installed successfully!")
         console.print(f"\n[bold]{manifest.name}[/bold] (v{manifest.version})")
         console.print(f"  {manifest.description}")
+
+        for warning in manifest.warnings:
+            console.print(f"\n[yellow]⚠  Compatibility warning:[/yellow] {warning}")
+
         console.print("\n[bold cyan]Provided commands:[/bold cyan]")
         for cmd in manifest.commands:
             console.print(f"  • {cmd['name']} - {cmd.get('description', '')}")
+
+        # Report agent skills registration
+        reg_meta = manager.registry.get(manifest.id)
+        reg_skills = reg_meta.get("registered_skills", []) if reg_meta else []
+        # Normalize to guard against corrupted registry entries
+        if not isinstance(reg_skills, list):
+            reg_skills = []
+        if reg_skills:
+            console.print(f"\n[green]✓[/green] {len(reg_skills)} agent skill(s) auto-registered")
 
         console.print("\n[yellow]⚠[/yellow]  Configuration may be required")
         console.print(f"   Check: .specify/extensions/{manifest.id}/")
@@ -2333,29 +3845,39 @@ def extension_remove(
     """Uninstall an extension."""
     from .extensions import ExtensionManager
 
-    project_root = Path.cwd()
-
-    # Check if we're in a spec-kit project
-    specify_dir = project_root / ".specify"
-    if not specify_dir.exists():
-        console.print("[red]Error:[/red] Not a spec-kit project (no .specify/ directory)")
-        console.print("Run this command from a spec-kit project root")
-        raise typer.Exit(1)
-
+    project_root = _require_specify_project()
     manager = ExtensionManager(project_root)
 
     # Resolve extension ID from argument (handles ambiguous names)
     installed = manager.list_installed()
     extension_id, display_name = _resolve_installed_extension(extension, installed, "remove")
 
-    # Get extension info for command count
+    # Get extension info for command and skill counts
     ext_manifest = manager.get_extension(extension_id)
-    cmd_count = len(ext_manifest.commands) if ext_manifest else 0
+    reg_meta = manager.registry.get(extension_id)
+    # Derive cmd_count from the registry's registered_commands (includes aliases)
+    # rather than from the manifest (primary commands only). Use max() across
+    # agents to get the per-agent count; sum() would double-count since users
+    # think in logical commands, not per-agent file counts.
+    # Use get() without a default so we can distinguish "key missing" (fall back
+    # to manifest) from "key present but empty dict" (zero commands registered).
+    registered_commands = reg_meta.get("registered_commands") if isinstance(reg_meta, dict) else None
+    if isinstance(registered_commands, dict):
+        cmd_count = max(
+            (len(v) for v in registered_commands.values() if isinstance(v, list)),
+            default=0,
+        )
+    else:
+        cmd_count = len(ext_manifest.commands) if ext_manifest else 0
+    raw_skills = reg_meta.get("registered_skills") if reg_meta else None
+    skill_count = len(raw_skills) if isinstance(raw_skills, list) else 0
 
     # Confirm removal
     if not force:
         console.print("\n[yellow]⚠  This will remove:[/yellow]")
-        console.print(f"   • {cmd_count} commands from AI agent")
+        console.print(f"   • {cmd_count} command{'s' if cmd_count != 1 else ''} per agent")
+        if skill_count:
+            console.print(f"   • {skill_count} agent skill(s)")
         console.print(f"   • Extension directory: .specify/extensions/{extension_id}/")
         if not keep_config:
             console.print("   • Config files (will be backed up)")
@@ -2391,15 +3913,7 @@ def extension_search(
     """Search for available extensions in catalog."""
     from .extensions import ExtensionCatalog, ExtensionError
 
-    project_root = Path.cwd()
-
-    # Check if we're in a spec-kit project
-    specify_dir = project_root / ".specify"
-    if not specify_dir.exists():
-        console.print("[red]Error:[/red] Not a spec-kit project (no .specify/ directory)")
-        console.print("Run this command from a spec-kit project root")
-        raise typer.Exit(1)
-
+    project_root = _require_specify_project()
     catalog = ExtensionCatalog(project_root)
 
     try:
@@ -2473,17 +3987,9 @@ def extension_info(
     extension: str = typer.Argument(help="Extension ID or name"),
 ):
     """Show detailed information about an extension."""
-    from .extensions import ExtensionCatalog, ExtensionManager
+    from .extensions import ExtensionCatalog, ExtensionManager, normalize_priority
 
-    project_root = Path.cwd()
-
-    # Check if we're in a spec-kit project
-    specify_dir = project_root / ".specify"
-    if not specify_dir.exists():
-        console.print("[red]Error:[/red] Not a spec-kit project (no .specify/ directory)")
-        console.print("Run this command from a spec-kit project root")
-        raise typer.Exit(1)
-
+    project_root = _require_specify_project()
     catalog = ExtensionCatalog(project_root)
     manager = ExtensionManager(project_root)
     installed = manager.list_installed()
@@ -2510,8 +4016,15 @@ def extension_info(
         # Get local manifest info
         ext_manifest = manager.get_extension(resolved_installed_id)
         metadata = manager.registry.get(resolved_installed_id)
+        metadata_is_dict = isinstance(metadata, dict)
+        if not metadata_is_dict:
+            console.print(
+                "[yellow]Warning:[/yellow] Extension metadata appears to be corrupted; "
+                "some information may be unavailable."
+            )
+        version = metadata.get("version", "unknown") if metadata_is_dict else "unknown"
 
-        console.print(f"\n[bold]{resolved_installed_name}[/bold] (v{metadata.get('version', 'unknown')})")
+        console.print(f"\n[bold]{resolved_installed_name}[/bold] (v{version})")
         console.print(f"ID: {resolved_installed_id}")
         console.print()
 
@@ -2539,6 +4052,8 @@ def extension_info(
 
         console.print()
         console.print("[green]✓ Installed[/green]")
+        priority = normalize_priority(metadata.get("priority") if metadata_is_dict else None)
+        console.print(f"[dim]Priority:[/dim] {priority}")
         console.print(f"\nTo remove: specify extension remove {resolved_installed_id}")
         return
 
@@ -2554,6 +4069,8 @@ def extension_info(
 
 def _print_extension_info(ext_info: dict, manager):
     """Print formatted extension info from catalog data."""
+    from .extensions import normalize_priority
+
     # Header
     verified_badge = " [green]✓ Verified[/green]" if ext_info.get("verified") else ""
     console.print(f"\n[bold]{ext_info['name']}[/bold] (v{ext_info['version']}){verified_badge}")
@@ -2632,6 +4149,9 @@ def _print_extension_info(ext_info: dict, manager):
     install_allowed = ext_info.get("_install_allowed", True)
     if is_installed:
         console.print("[green]✓ Installed[/green]")
+        metadata = manager.registry.get(ext_info['id'])
+        priority = normalize_priority(metadata.get("priority") if isinstance(metadata, dict) else None)
+        console.print(f"[dim]Priority:[/dim] {priority}")
         console.print(f"\nTo remove: specify extension remove {ext_info['id']}")
     elif install_allowed:
         console.print("[yellow]Not installed[/yellow]")
@@ -2658,19 +4178,12 @@ def extension_update(
         ValidationError,
         CommandRegistrar,
         HookExecutor,
+        normalize_priority,
     )
     from packaging import version as pkg_version
     import shutil
 
-    project_root = Path.cwd()
-
-    # Check if we're in a spec-kit project
-    specify_dir = project_root / ".specify"
-    if not specify_dir.exists():
-        console.print("[red]Error:[/red] Not a spec-kit project (no .specify/ directory)")
-        console.print("Run this command from a spec-kit project root")
-        raise typer.Exit(1)
-
+    project_root = _require_specify_project()
     manager = ExtensionManager(project_root)
     catalog = ExtensionCatalog(project_root)
     speckit_version = get_speckit_version()
@@ -2697,7 +4210,7 @@ def extension_update(
         for ext_id in extensions_to_update:
             # Get installed version
             metadata = manager.registry.get(ext_id)
-            if metadata is None or "version" not in metadata:
+            if metadata is None or not isinstance(metadata, dict) or "version" not in metadata:
                 console.print(f"⚠  {ext_id}: Registry entry corrupted or missing (skipping)")
                 continue
             try:
@@ -2763,6 +4276,10 @@ def extension_update(
         failed_updates = []
         registrar = CommandRegistrar()
         hook_executor = HookExecutor(project_root)
+        from .agents import CommandRegistrar as _AgentReg  # used in backup and rollback paths
+
+        # UNSET sentinel: backup not yet captured (exception before backup step)
+        UNSET = object()
 
         for update in updates_available:
             extension_id = update["id"]
@@ -2776,8 +4293,9 @@ def extension_update(
             backup_config_dir = backup_base / "config"
 
             # Store backup state
-            backup_registry_entry = None
-            backup_hooks = None  # None means no hooks key in config; {} means hooks key existed
+            backup_registry_entry = None  # None means registry entry not yet captured
+            backup_installed = UNSET  # Original installed list from extensions.yml
+            backup_hooks = None  # None means backup step 4 not yet reached; {} or {...} means backup was captured
             backed_up_command_files = {}
 
             try:
@@ -2802,7 +4320,7 @@ def extension_update(
                         shutil.copy2(cfg_file, backup_config_dir / cfg_file.name)
 
                 # 3. Backup command files for all agents
-                registered_commands = backup_registry_entry.get("registered_commands", {})
+                registered_commands = backup_registry_entry.get("registered_commands", {}) if isinstance(backup_registry_entry, dict) else {}
                 for agent_name, cmd_names in registered_commands.items():
                     if agent_name not in registrar.AGENT_CONFIGS:
                         continue
@@ -2810,7 +4328,8 @@ def extension_update(
                     commands_dir = project_root / agent_config["dir"]
 
                     for cmd_name in cmd_names:
-                        cmd_file = commands_dir / f"{cmd_name}{agent_config['extension']}"
+                        output_name = _AgentReg._compute_output_name(agent_name, cmd_name, agent_config)
+                        cmd_file = commands_dir / f"{output_name}{agent_config['extension']}"
                         if cmd_file.exists():
                             backup_cmd_path = backup_commands_dir / agent_name / cmd_file.name
                             backup_cmd_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2826,14 +4345,20 @@ def extension_update(
                                 shutil.copy2(prompt_file, backup_prompt_path)
                                 backed_up_command_files[str(prompt_file)] = str(backup_prompt_path)
 
-                # 4. Backup hooks from extensions.yml
-                # Use backup_hooks=None to indicate config had no "hooks" key (don't create on restore)
-                # Use backup_hooks={} to indicate config had "hooks" key with no hooks for this extension
+                # 4. Backup hooks and installed list from extensions.yml
+                # get_project_config() always normalizes installed->[] and hooks->{},
+                # so no sentinel is needed to distinguish key-absent from key-empty.
                 config = hook_executor.get_project_config()
-                if "hooks" in config:
-                    backup_hooks = {}  # Config has hooks key - preserve this fact
-                    for hook_name, hook_list in config["hooks"].items():
-                        ext_hooks = [h for h in hook_list if h.get("extension") == extension_id]
+                if isinstance(config, dict):
+                    import copy
+                    # Deep-copy so nested mapping entries (e.g. version-pin dicts)
+                    # are not affected by in-place mutations during the update.
+                    backup_installed = copy.deepcopy(config.get("installed", []))
+                    backup_hooks = {}
+                    for hook_name, hook_list in config.get("hooks", {}).items():
+                        if not isinstance(hook_list, list):
+                            continue
+                        ext_hooks = [h for h in hook_list if isinstance(h, dict) and h.get("extension") == extension_id]
                         if ext_hooks:
                             backup_hooks[hook_name] = ext_hooks
 
@@ -2882,19 +4407,23 @@ def extension_update(
                                 shutil.copy2(cfg_file, new_extension_dir / cfg_file.name)
 
                     # 9. Restore metadata from backup (installed_at, enabled state)
-                    if backup_registry_entry:
+                    if backup_registry_entry and isinstance(backup_registry_entry, dict):
                         # Copy current registry entry to avoid mutating internal
                         # registry state before explicit restore().
                         current_metadata = manager.registry.get(extension_id)
-                        if current_metadata is None:
+                        if current_metadata is None or not isinstance(current_metadata, dict):
                             raise RuntimeError(
-                                f"Registry entry for '{extension_id}' missing after install — update incomplete"
+                                f"Registry entry for '{extension_id}' missing or corrupted after install — update incomplete"
                             )
                         new_metadata = dict(current_metadata)
 
                         # Preserve the original installation timestamp
                         if "installed_at" in backup_registry_entry:
                             new_metadata["installed_at"] = backup_registry_entry["installed_at"]
+
+                        # Preserve the original priority (normalized to handle corruption)
+                        if "priority" in backup_registry_entry:
+                            new_metadata["priority"] = normalize_priority(backup_registry_entry["priority"])
 
                         # If extension was disabled before update, disable it again
                         if not backup_registry_entry.get("enabled", True):
@@ -2949,7 +4478,7 @@ def extension_update(
                     # (files that weren't in the original backup)
                     try:
                         new_registry_entry = manager.registry.get(extension_id)
-                        if new_registry_entry is None:
+                        if new_registry_entry is None or not isinstance(new_registry_entry, dict):
                             new_registered_commands = {}
                         else:
                             new_registered_commands = new_registry_entry.get("registered_commands", {})
@@ -2960,7 +4489,8 @@ def extension_update(
                             commands_dir = project_root / agent_config["dir"]
 
                             for cmd_name in cmd_names:
-                                cmd_file = commands_dir / f"{cmd_name}{agent_config['extension']}"
+                                output_name = _AgentReg._compute_output_name(agent_name, cmd_name, agent_config)
+                                cmd_file = commands_dir / f"{output_name}{agent_config['extension']}"
                                 # Delete if it exists and wasn't in our backup
                                 if cmd_file.exists() and str(cmd_file) not in backed_up_command_files:
                                     cmd_file.unlink()
@@ -2981,35 +4511,51 @@ def extension_update(
                             original_file.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(backup_file, original_file)
 
-                    # Restore hooks in extensions.yml
-                    # - backup_hooks=None means original config had no "hooks" key
-                    # - backup_hooks={} or {...} means config had hooks key
-                    config = hook_executor.get_project_config()
-                    if "hooks" in config:
+                    # Restore metadata in extensions.yml (hooks and installed list).
+                    # Only run if backup step 4 was reached (backup_hooks is not None);
+                    # otherwise we have no safe baseline to restore from and could corrupt
+                    # the config by removing pre-existing hooks.
+                    if backup_hooks is not None:
+                        config = hook_executor.get_project_config()
+                        if not isinstance(config, dict):
+                            config = {}
+
                         modified = False
 
-                        if backup_hooks is None:
-                            # Original config had no "hooks" key; remove it entirely
-                            del config["hooks"]
+                        # 1. Restore hooks in extensions.yml
+                        if not isinstance(config.get("hooks"), dict):
+                            config["hooks"] = {}
                             modified = True
-                        else:
-                            # Remove any hooks for this extension added by failed install
-                            for hook_name, hooks_list in config["hooks"].items():
-                                original_len = len(hooks_list)
-                                config["hooks"][hook_name] = [
-                                    h for h in hooks_list
-                                    if h.get("extension") != extension_id
-                                ]
-                                if len(config["hooks"][hook_name]) != original_len:
-                                    modified = True
 
-                            # Add back the backed up hooks if any
-                            if backup_hooks:
-                                for hook_name, hooks in backup_hooks.items():
-                                    if hook_name not in config["hooks"]:
-                                        config["hooks"][hook_name] = []
-                                    config["hooks"][hook_name].extend(hooks)
-                                    modified = True
+                        # Remove any hooks for this extension added by the failed install
+                        for hook_name in list(config["hooks"].keys()):
+                            hooks_list = config["hooks"][hook_name]
+                            if not isinstance(hooks_list, list):
+                                config["hooks"][hook_name] = []
+                                modified = True
+                                continue
+
+                            original_len = len(hooks_list)
+                            config["hooks"][hook_name] = [
+                                h for h in hooks_list
+                                if isinstance(h, dict) and h.get("extension") != extension_id
+                            ]
+                            if len(config["hooks"][hook_name]) != original_len:
+                                modified = True
+
+                        # Add back the backed-up hooks
+                        if backup_hooks:
+                            for hook_name, hooks in backup_hooks.items():
+                                if not isinstance(config["hooks"].get(hook_name), list):
+                                    config["hooks"][hook_name] = []
+                                config["hooks"][hook_name].extend(hooks)
+                                modified = True
+
+                        # 2. Restore installed list in extensions.yml
+                        if backup_installed is not UNSET:
+                            if config.get("installed") != backup_installed:
+                                config["installed"] = backup_installed
+                                modified = True
 
                         if modified:
                             hook_executor.save_project_config(config)
@@ -3051,15 +4597,7 @@ def extension_enable(
     """Enable a disabled extension."""
     from .extensions import ExtensionManager, HookExecutor
 
-    project_root = Path.cwd()
-
-    # Check if we're in a spec-kit project
-    specify_dir = project_root / ".specify"
-    if not specify_dir.exists():
-        console.print("[red]Error:[/red] Not a spec-kit project (no .specify/ directory)")
-        console.print("Run this command from a spec-kit project root")
-        raise typer.Exit(1)
-
+    project_root = _require_specify_project()
     manager = ExtensionManager(project_root)
     hook_executor = HookExecutor(project_root)
 
@@ -3069,16 +4607,15 @@ def extension_enable(
 
     # Update registry
     metadata = manager.registry.get(extension_id)
-    if metadata is None:
+    if metadata is None or not isinstance(metadata, dict):
         console.print(f"[red]Error:[/red] Extension '{extension_id}' not found in registry (corrupted state)")
         raise typer.Exit(1)
-    
+
     if metadata.get("enabled", True):
         console.print(f"[yellow]Extension '{display_name}' is already enabled[/yellow]")
         raise typer.Exit(0)
 
-    metadata["enabled"] = True
-    manager.registry.update(extension_id, metadata)
+    manager.registry.update(extension_id, {"enabled": True})
 
     # Enable hooks in extensions.yml
     config = hook_executor.get_project_config()
@@ -3099,15 +4636,7 @@ def extension_disable(
     """Disable an extension without removing it."""
     from .extensions import ExtensionManager, HookExecutor
 
-    project_root = Path.cwd()
-
-    # Check if we're in a spec-kit project
-    specify_dir = project_root / ".specify"
-    if not specify_dir.exists():
-        console.print("[red]Error:[/red] Not a spec-kit project (no .specify/ directory)")
-        console.print("Run this command from a spec-kit project root")
-        raise typer.Exit(1)
-
+    project_root = _require_specify_project()
     manager = ExtensionManager(project_root)
     hook_executor = HookExecutor(project_root)
 
@@ -3117,16 +4646,15 @@ def extension_disable(
 
     # Update registry
     metadata = manager.registry.get(extension_id)
-    if metadata is None:
+    if metadata is None or not isinstance(metadata, dict):
         console.print(f"[red]Error:[/red] Extension '{extension_id}' not found in registry (corrupted state)")
         raise typer.Exit(1)
-    
+
     if not metadata.get("enabled", True):
         console.print(f"[yellow]Extension '{display_name}' is already disabled[/yellow]")
         raise typer.Exit(0)
 
-    metadata["enabled"] = False
-    manager.registry.update(extension_id, metadata)
+    manager.registry.update(extension_id, {"enabled": False})
 
     # Disable hooks in extensions.yml
     config = hook_executor.get_project_config()
@@ -3140,6 +4668,671 @@ def extension_disable(
     console.print(f"[green]✓[/green] Extension '{display_name}' disabled")
     console.print("\nCommands will no longer be available. Hooks will not execute.")
     console.print(f"To re-enable: specify extension enable {extension_id}")
+
+
+@extension_app.command("set-priority")
+def extension_set_priority(
+    extension: str = typer.Argument(help="Extension ID or name"),
+    priority: int = typer.Argument(help="New priority (lower = higher precedence)"),
+):
+    """Set the resolution priority of an installed extension."""
+    from .extensions import ExtensionManager
+
+    project_root = _require_specify_project()
+    # Validate priority
+    if priority < 1:
+        console.print("[red]Error:[/red] Priority must be a positive integer (1 or higher)")
+        raise typer.Exit(1)
+
+    manager = ExtensionManager(project_root)
+
+    # Resolve extension ID from argument (handles ambiguous names)
+    installed = manager.list_installed()
+    extension_id, display_name = _resolve_installed_extension(extension, installed, "set-priority")
+
+    # Get current metadata
+    metadata = manager.registry.get(extension_id)
+    if metadata is None or not isinstance(metadata, dict):
+        console.print(f"[red]Error:[/red] Extension '{extension_id}' not found in registry (corrupted state)")
+        raise typer.Exit(1)
+
+    from .extensions import normalize_priority
+    raw_priority = metadata.get("priority")
+    # Only skip if the stored value is already a valid int equal to requested priority
+    # This ensures corrupted values (e.g., "high") get repaired even when setting to default (10)
+    if isinstance(raw_priority, int) and raw_priority == priority:
+        console.print(f"[yellow]Extension '{display_name}' already has priority {priority}[/yellow]")
+        raise typer.Exit(0)
+
+    old_priority = normalize_priority(raw_priority)
+
+    # Update priority
+    manager.registry.update(extension_id, {"priority": priority})
+
+    console.print(f"[green]✓[/green] Extension '{display_name}' priority changed: {old_priority} → {priority}")
+    console.print("\n[dim]Lower priority = higher precedence in template resolution[/dim]")
+
+
+# ===== Workflow Commands =====
+
+workflow_app = typer.Typer(
+    name="workflow",
+    help="Manage and run automation workflows",
+    add_completion=False,
+)
+app.add_typer(workflow_app, name="workflow")
+
+workflow_catalog_app = typer.Typer(
+    name="catalog",
+    help="Manage workflow catalogs",
+    add_completion=False,
+)
+workflow_app.add_typer(workflow_catalog_app, name="catalog")
+
+
+@workflow_app.command("run")
+def workflow_run(
+    source: str = typer.Argument(..., help="Workflow ID or YAML file path"),
+    input_values: list[str] | None = typer.Option(
+        None, "--input", "-i", help="Input values as key=value pairs"
+    ),
+):
+    """Run a workflow from an installed ID or local YAML path."""
+    from .workflows.engine import WorkflowEngine
+
+    project_root = _require_specify_project()
+    engine = WorkflowEngine(project_root)
+    engine.on_step_start = lambda sid, label: console.print(f"  \u25b8 [{sid}] {label} \u2026")
+
+    try:
+        definition = engine.load_workflow(source)
+    except FileNotFoundError:
+        console.print(f"[red]Error:[/red] Workflow not found: {source}")
+        raise typer.Exit(1)
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] Invalid workflow: {exc}")
+        raise typer.Exit(1)
+
+    # Validate
+    errors = engine.validate(definition)
+    if errors:
+        console.print("[red]Workflow validation failed:[/red]")
+        for err in errors:
+            console.print(f"  • {err}")
+        raise typer.Exit(1)
+
+    # Parse inputs
+    inputs: dict[str, Any] = {}
+    if input_values:
+        for kv in input_values:
+            if "=" not in kv:
+                console.print(f"[red]Error:[/red] Invalid input format: {kv!r} (expected key=value)")
+                raise typer.Exit(1)
+            key, _, value = kv.partition("=")
+            inputs[key.strip()] = value.strip()
+
+    console.print(f"\n[bold cyan]Running workflow:[/bold cyan] {definition.name} ({definition.id})")
+    console.print(f"[dim]Version: {definition.version}[/dim]\n")
+
+    try:
+        state = engine.execute(definition, inputs)
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+    except Exception as exc:
+        console.print(f"[red]Workflow failed:[/red] {exc}")
+        raise typer.Exit(1)
+
+    status_colors = {
+        "completed": "green",
+        "paused": "yellow",
+        "failed": "red",
+        "aborted": "red",
+    }
+    color = status_colors.get(state.status.value, "white")
+    console.print(f"\n[{color}]Status: {state.status.value}[/{color}]")
+    console.print(f"[dim]Run ID: {state.run_id}[/dim]")
+
+    if state.status.value == "paused":
+        console.print(f"\nResume with: [cyan]specify workflow resume {state.run_id}[/cyan]")
+
+
+@workflow_app.command("resume")
+def workflow_resume(
+    run_id: str = typer.Argument(..., help="Run ID to resume"),
+):
+    """Resume a paused or failed workflow run."""
+    from .workflows.engine import WorkflowEngine
+
+    project_root = _require_specify_project()
+    engine = WorkflowEngine(project_root)
+    engine.on_step_start = lambda sid, label: console.print(f"  \u25b8 [{sid}] {label} \u2026")
+
+    try:
+        state = engine.resume(run_id)
+    except FileNotFoundError:
+        console.print(f"[red]Error:[/red] Run not found: {run_id}")
+        raise typer.Exit(1)
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+    except Exception as exc:
+        console.print(f"[red]Resume failed:[/red] {exc}")
+        raise typer.Exit(1)
+
+    status_colors = {
+        "completed": "green",
+        "paused": "yellow",
+        "failed": "red",
+        "aborted": "red",
+    }
+    color = status_colors.get(state.status.value, "white")
+    console.print(f"\n[{color}]Status: {state.status.value}[/{color}]")
+
+
+@workflow_app.command("status")
+def workflow_status(
+    run_id: str | None = typer.Argument(None, help="Run ID to inspect (shows all if omitted)"),
+):
+    """Show workflow run status."""
+    from .workflows.engine import WorkflowEngine
+
+    project_root = _require_specify_project()
+    engine = WorkflowEngine(project_root)
+
+    if run_id:
+        try:
+            from .workflows.engine import RunState
+            state = RunState.load(run_id, project_root)
+        except FileNotFoundError:
+            console.print(f"[red]Error:[/red] Run not found: {run_id}")
+            raise typer.Exit(1)
+
+        status_colors = {
+            "completed": "green",
+            "paused": "yellow",
+            "failed": "red",
+            "aborted": "red",
+            "running": "blue",
+            "created": "dim",
+        }
+        color = status_colors.get(state.status.value, "white")
+
+        console.print(f"\n[bold cyan]Workflow Run: {state.run_id}[/bold cyan]")
+        console.print(f"  Workflow: {state.workflow_id}")
+        console.print(f"  Status:   [{color}]{state.status.value}[/{color}]")
+        console.print(f"  Created:  {state.created_at}")
+        console.print(f"  Updated:  {state.updated_at}")
+
+        if state.current_step_id:
+            console.print(f"  Current:  {state.current_step_id}")
+
+        if state.step_results:
+            console.print(f"\n  [bold]Steps ({len(state.step_results)}):[/bold]")
+            for step_id, step_data in state.step_results.items():
+                s = step_data.get("status", "unknown")
+                sc = {"completed": "green", "failed": "red", "paused": "yellow"}.get(s, "white")
+                console.print(f"    [{sc}]●[/{sc}] {step_id}: {s}")
+    else:
+        runs = engine.list_runs()
+        if not runs:
+            console.print("[yellow]No workflow runs found.[/yellow]")
+            return
+
+        console.print("\n[bold cyan]Workflow Runs:[/bold cyan]\n")
+        for run_data in runs:
+            s = run_data.get("status", "unknown")
+            sc = {"completed": "green", "failed": "red", "paused": "yellow", "running": "blue"}.get(s, "white")
+            console.print(
+                f"  [{sc}]●[/{sc}] {run_data['run_id']}  "
+                f"{run_data.get('workflow_id', '?')}  "
+                f"[{sc}]{s}[/{sc}]  "
+                f"[dim]{run_data.get('updated_at', '?')}[/dim]"
+            )
+
+
+@workflow_app.command("list")
+def workflow_list():
+    """List installed workflows."""
+    from .workflows.catalog import WorkflowRegistry
+
+    project_root = _require_specify_project()
+    registry = WorkflowRegistry(project_root)
+    installed = registry.list()
+
+    if not installed:
+        console.print("[yellow]No workflows installed.[/yellow]")
+        console.print("\nInstall a workflow with:")
+        console.print("  [cyan]specify workflow add <workflow-id>[/cyan]")
+        return
+
+    console.print("\n[bold cyan]Installed Workflows:[/bold cyan]\n")
+    for wf_id, wf_data in installed.items():
+        console.print(f"  [bold]{wf_data.get('name', wf_id)}[/bold] ({wf_id}) v{wf_data.get('version', '?')}")
+        desc = wf_data.get("description", "")
+        if desc:
+            console.print(f"    {desc}")
+        console.print()
+
+
+@workflow_app.command("add")
+def workflow_add(
+    source: str = typer.Argument(..., help="Workflow ID, URL, or local path"),
+):
+    """Install a workflow from catalog, URL, or local path."""
+    from .workflows.catalog import WorkflowCatalog, WorkflowRegistry, WorkflowCatalogError
+    from .workflows.engine import WorkflowDefinition
+
+    project_root = _require_specify_project()
+    registry = WorkflowRegistry(project_root)
+    workflows_dir = project_root / ".specify" / "workflows"
+
+    def _validate_and_install_local(yaml_path: Path, source_label: str) -> None:
+        """Validate and install a workflow from a local YAML file."""
+        try:
+            definition = WorkflowDefinition.from_yaml(yaml_path)
+        except (ValueError, yaml.YAMLError) as exc:
+            console.print(f"[red]Error:[/red] Invalid workflow YAML: {exc}")
+            raise typer.Exit(1)
+        if not definition.id or not definition.id.strip():
+            console.print("[red]Error:[/red] Workflow definition has an empty or missing 'id'")
+            raise typer.Exit(1)
+
+        from .workflows.engine import validate_workflow
+        errors = validate_workflow(definition)
+        if errors:
+            console.print("[red]Error:[/red] Workflow validation failed:")
+            for err in errors:
+                console.print(f"  \u2022 {err}")
+            raise typer.Exit(1)
+
+        dest_dir = workflows_dir / definition.id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.copy2(yaml_path, dest_dir / "workflow.yml")
+        registry.add(definition.id, {
+            "name": definition.name,
+            "version": definition.version,
+            "description": definition.description,
+            "source": source_label,
+        })
+        console.print(f"[green]✓[/green] Workflow '{definition.name}' ({definition.id}) installed")
+
+    # Try as URL (http/https)
+    if source.startswith("http://") or source.startswith("https://"):
+        from ipaddress import ip_address
+        from urllib.parse import urlparse
+        from specify_cli.authentication.http import open_url as _open_url
+
+        parsed_src = urlparse(source)
+        src_host = parsed_src.hostname or ""
+        src_loopback = src_host == "localhost"
+        if not src_loopback:
+            try:
+                src_loopback = ip_address(src_host).is_loopback
+            except ValueError:
+                # Host is not an IP literal (e.g., a DNS name); keep default non-loopback.
+                pass
+        if parsed_src.scheme != "https" and not (parsed_src.scheme == "http" and src_loopback):
+            console.print("[red]Error:[/red] Only HTTPS URLs are allowed, except HTTP for localhost.")
+            raise typer.Exit(1)
+
+        import tempfile
+        try:
+            with _open_url(source, timeout=30) as resp:
+                final_url = resp.geturl()
+                final_parsed = urlparse(final_url)
+                final_host = final_parsed.hostname or ""
+                final_lb = final_host == "localhost"
+                if not final_lb:
+                    try:
+                        final_lb = ip_address(final_host).is_loopback
+                    except ValueError:
+                        # Redirect host is not an IP literal; keep loopback as determined above.
+                        pass
+                if final_parsed.scheme != "https" and not (final_parsed.scheme == "http" and final_lb):
+                    console.print(f"[red]Error:[/red] URL redirected to non-HTTPS: {final_url}")
+                    raise typer.Exit(1)
+                with tempfile.NamedTemporaryFile(suffix=".yml", delete=False) as tmp:
+                    tmp.write(resp.read())
+                    tmp_path = Path(tmp.name)
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            console.print(f"[red]Error:[/red] Failed to download workflow: {exc}")
+            raise typer.Exit(1)
+        try:
+            _validate_and_install_local(tmp_path, source)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        return
+
+    # Try as a local file/directory
+    source_path = Path(source)
+    if source_path.exists():
+        if source_path.is_file() and source_path.suffix in (".yml", ".yaml"):
+            _validate_and_install_local(source_path, str(source_path))
+            return
+        elif source_path.is_dir():
+            wf_file = source_path / "workflow.yml"
+            if not wf_file.exists():
+                console.print(f"[red]Error:[/red] No workflow.yml found in {source}")
+                raise typer.Exit(1)
+            _validate_and_install_local(wf_file, str(source_path))
+            return
+
+    # Try from catalog
+    catalog = WorkflowCatalog(project_root)
+    try:
+        info = catalog.get_workflow_info(source)
+    except WorkflowCatalogError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    if not info:
+        console.print(f"[red]Error:[/red] Workflow '{source}' not found in catalog")
+        raise typer.Exit(1)
+
+    if not info.get("_install_allowed", True):
+        console.print(f"[yellow]Warning:[/yellow] Workflow '{source}' is from a discovery-only catalog")
+        console.print("Direct installation is not enabled for this catalog source.")
+        raise typer.Exit(1)
+
+    workflow_url = info.get("url")
+    if not workflow_url:
+        console.print(f"[red]Error:[/red] Workflow '{source}' does not have an install URL in the catalog")
+        raise typer.Exit(1)
+
+    # Validate URL scheme (HTTPS required, HTTP allowed for localhost only)
+    from ipaddress import ip_address
+    from urllib.parse import urlparse
+
+    parsed_url = urlparse(workflow_url)
+    url_host = parsed_url.hostname or ""
+    is_loopback = False
+    if url_host == "localhost":
+        is_loopback = True
+    else:
+        try:
+            is_loopback = ip_address(url_host).is_loopback
+        except ValueError:
+            # Host is not an IP literal (e.g., a regular hostname); treat as non-loopback.
+            pass
+    if parsed_url.scheme != "https" and not (parsed_url.scheme == "http" and is_loopback):
+        console.print(
+            f"[red]Error:[/red] Workflow '{source}' has an invalid install URL. "
+            "Only HTTPS URLs are allowed, except HTTP for localhost/loopback."
+        )
+        raise typer.Exit(1)
+
+    workflow_dir = workflows_dir / source
+    # Validate that source is a safe directory name (no path traversal)
+    try:
+        workflow_dir.resolve().relative_to(workflows_dir.resolve())
+    except ValueError:
+        console.print(f"[red]Error:[/red] Invalid workflow ID: {source!r}")
+        raise typer.Exit(1)
+    workflow_file = workflow_dir / "workflow.yml"
+
+    try:
+        from specify_cli.authentication.http import open_url as _open_url
+
+        workflow_dir.mkdir(parents=True, exist_ok=True)
+        with _open_url(workflow_url, timeout=30) as response:
+            # Validate final URL after redirects
+            final_url = response.geturl()
+            final_parsed = urlparse(final_url)
+            final_host = final_parsed.hostname or ""
+            final_loopback = final_host == "localhost"
+            if not final_loopback:
+                try:
+                    final_loopback = ip_address(final_host).is_loopback
+                except ValueError:
+                    # Host is not an IP literal (e.g., a regular hostname); treat as non-loopback.
+                    pass
+            if final_parsed.scheme != "https" and not (final_parsed.scheme == "http" and final_loopback):
+                if workflow_dir.exists():
+                    import shutil
+                    shutil.rmtree(workflow_dir, ignore_errors=True)
+                console.print(
+                    f"[red]Error:[/red] Workflow '{source}' redirected to non-HTTPS URL: {final_url}"
+                )
+                raise typer.Exit(1)
+            workflow_file.write_bytes(response.read())
+    except Exception as exc:
+        if workflow_dir.exists():
+            import shutil
+            shutil.rmtree(workflow_dir, ignore_errors=True)
+        console.print(f"[red]Error:[/red] Failed to install workflow '{source}' from catalog: {exc}")
+        raise typer.Exit(1)
+
+    # Validate the downloaded workflow before registering
+    try:
+        definition = WorkflowDefinition.from_yaml(workflow_file)
+    except (ValueError, yaml.YAMLError) as exc:
+        import shutil
+        shutil.rmtree(workflow_dir, ignore_errors=True)
+        console.print(f"[red]Error:[/red] Downloaded workflow is invalid: {exc}")
+        raise typer.Exit(1)
+
+    from .workflows.engine import validate_workflow
+    errors = validate_workflow(definition)
+    if errors:
+        import shutil
+        shutil.rmtree(workflow_dir, ignore_errors=True)
+        console.print("[red]Error:[/red] Downloaded workflow validation failed:")
+        for err in errors:
+            console.print(f"  \u2022 {err}")
+        raise typer.Exit(1)
+
+    # Enforce that the workflow's internal ID matches the catalog key
+    if definition.id and definition.id != source:
+        import shutil
+        shutil.rmtree(workflow_dir, ignore_errors=True)
+        console.print(
+            f"[red]Error:[/red] Workflow ID in YAML ({definition.id!r}) "
+            f"does not match catalog key ({source!r}). "
+            f"The catalog entry may be misconfigured."
+        )
+        raise typer.Exit(1)
+
+    registry.add(source, {
+        "name": definition.name or info.get("name", source),
+        "version": definition.version or info.get("version", "0.0.0"),
+        "description": definition.description or info.get("description", ""),
+        "source": "catalog",
+        "catalog_name": info.get("_catalog_name", ""),
+        "url": workflow_url,
+    })
+    console.print(f"[green]✓[/green] Workflow '{info.get('name', source)}' installed from catalog")
+
+
+@workflow_app.command("remove")
+def workflow_remove(
+    workflow_id: str = typer.Argument(..., help="Workflow ID to uninstall"),
+):
+    """Uninstall a workflow."""
+    from .workflows.catalog import WorkflowRegistry
+
+    project_root = _require_specify_project()
+    registry = WorkflowRegistry(project_root)
+
+    if not registry.is_installed(workflow_id):
+        console.print(f"[red]Error:[/red] Workflow '{workflow_id}' is not installed")
+        raise typer.Exit(1)
+
+    # Remove workflow files
+    workflow_dir = project_root / ".specify" / "workflows" / workflow_id
+    if workflow_dir.exists():
+        import shutil
+        shutil.rmtree(workflow_dir)
+
+    registry.remove(workflow_id)
+    console.print(f"[green]✓[/green] Workflow '{workflow_id}' removed")
+
+
+@workflow_app.command("search")
+def workflow_search(
+    query: str | None = typer.Argument(None, help="Search query"),
+    tag: str | None = typer.Option(None, "--tag", help="Filter by tag"),
+):
+    """Search workflow catalogs."""
+    from .workflows.catalog import WorkflowCatalog, WorkflowCatalogError
+
+    project_root = _require_specify_project()
+    catalog = WorkflowCatalog(project_root)
+
+    try:
+        results = catalog.search(query=query, tag=tag)
+    except WorkflowCatalogError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    if not results:
+        console.print("[yellow]No workflows found.[/yellow]")
+        return
+
+    console.print(f"\n[bold cyan]Workflows ({len(results)}):[/bold cyan]\n")
+    for wf in results:
+        console.print(f"  [bold]{wf.get('name', wf.get('id', '?'))}[/bold] ({wf.get('id', '?')}) v{wf.get('version', '?')}")
+        desc = wf.get("description", "")
+        if desc:
+            console.print(f"    {desc}")
+        tags = wf.get("tags", [])
+        if tags:
+            console.print(f"    [dim]Tags: {', '.join(tags)}[/dim]")
+        console.print()
+
+
+@workflow_app.command("info")
+def workflow_info(
+    workflow_id: str = typer.Argument(..., help="Workflow ID"),
+):
+    """Show workflow details and step graph."""
+    from .workflows.catalog import WorkflowCatalog, WorkflowRegistry, WorkflowCatalogError
+    from .workflows.engine import WorkflowEngine
+
+    project_root = _require_specify_project()
+
+    # Check installed first
+    registry = WorkflowRegistry(project_root)
+    installed = registry.get(workflow_id)
+
+    engine = WorkflowEngine(project_root)
+
+    definition = None
+    try:
+        definition = engine.load_workflow(workflow_id)
+    except FileNotFoundError:
+        # Local workflow definition not found on disk; fall back to
+        # catalog/registry lookup below.
+        pass
+
+    if definition:
+        console.print(f"\n[bold cyan]{definition.name}[/bold cyan] ({definition.id})")
+        console.print(f"  Version:     {definition.version}")
+        if definition.author:
+            console.print(f"  Author:      {definition.author}")
+        if definition.description:
+            console.print(f"  Description: {definition.description}")
+        if definition.default_integration:
+            console.print(f"  Integration: {definition.default_integration}")
+        if installed:
+            console.print("  [green]Installed[/green]")
+
+        if definition.inputs:
+            console.print("\n  [bold]Inputs:[/bold]")
+            for name, inp in definition.inputs.items():
+                if isinstance(inp, dict):
+                    req = "required" if inp.get("required") else "optional"
+                    console.print(f"    {name} ({inp.get('type', 'string')}) — {req}")
+
+        if definition.steps:
+            console.print(f"\n  [bold]Steps ({len(definition.steps)}):[/bold]")
+            for step in definition.steps:
+                stype = step.get("type", "command")
+                console.print(f"    → {step.get('id', '?')} [{stype}]")
+        return
+
+    # Try catalog
+    catalog = WorkflowCatalog(project_root)
+    try:
+        info = catalog.get_workflow_info(workflow_id)
+    except WorkflowCatalogError:
+        info = None
+
+    if info:
+        console.print(f"\n[bold cyan]{info.get('name', workflow_id)}[/bold cyan] ({workflow_id})")
+        console.print(f"  Version:     {info.get('version', '?')}")
+        if info.get("description"):
+            console.print(f"  Description: {info['description']}")
+        if info.get("tags"):
+            console.print(f"  Tags:        {', '.join(info['tags'])}")
+        console.print("  [yellow]Not installed[/yellow]")
+    else:
+        console.print(f"[red]Error:[/red] Workflow '{workflow_id}' not found")
+        raise typer.Exit(1)
+
+
+@workflow_catalog_app.command("list")
+def workflow_catalog_list():
+    """List configured workflow catalog sources."""
+    from .workflows.catalog import WorkflowCatalog, WorkflowCatalogError
+
+    project_root = _require_specify_project()
+    catalog = WorkflowCatalog(project_root)
+
+    try:
+        configs = catalog.get_catalog_configs()
+    except WorkflowCatalogError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print("\n[bold cyan]Workflow Catalog Sources:[/bold cyan]\n")
+    for i, cfg in enumerate(configs):
+        install_status = "[green]install allowed[/green]" if cfg["install_allowed"] else "[yellow]discovery only[/yellow]"
+        console.print(f"  [{i}] [bold]{cfg['name']}[/bold] — {install_status}")
+        console.print(f"      {cfg['url']}")
+        if cfg.get("description"):
+            console.print(f"      [dim]{cfg['description']}[/dim]")
+        console.print()
+
+
+@workflow_catalog_app.command("add")
+def workflow_catalog_add(
+    url: str = typer.Argument(..., help="Catalog URL to add"),
+    name: str = typer.Option(None, "--name", help="Catalog name"),
+):
+    """Add a workflow catalog source."""
+    from .workflows.catalog import WorkflowCatalog, WorkflowValidationError
+
+    project_root = _require_specify_project()
+    catalog = WorkflowCatalog(project_root)
+    try:
+        catalog.add_catalog(url, name)
+    except WorkflowValidationError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓[/green] Catalog source added: {url}")
+
+
+@workflow_catalog_app.command("remove")
+def workflow_catalog_remove(
+    index: int = typer.Argument(..., help="Catalog index to remove (from 'catalog list')"),
+):
+    """Remove a workflow catalog source by index."""
+    from .workflows.catalog import WorkflowCatalog, WorkflowValidationError
+
+    project_root = _require_specify_project()
+    catalog = WorkflowCatalog(project_root)
+    try:
+        removed_name = catalog.remove_catalog(index)
+    except WorkflowValidationError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    console.print(f"[green]✓[/green] Catalog source '{removed_name}' removed")
 
 
 def main():
