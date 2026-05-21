@@ -24,11 +24,14 @@ specify extension search  # Now uses your organization's catalog instead of the 
 
 ### Community Reference Catalog (`catalog.community.json`)
 
+> [!NOTE]
+> Community extensions are independently created and maintained by their respective authors. Maintainers only verify that catalog entries are complete and correctly formatted — they do **not review, audit, endorse, or support the extension code itself**. Review extension source code before installation and use at your own discretion.
+
 - **Purpose**: Browse available community-contributed extensions
 - **Status**: Active - contains extensions submitted by the community
 - **Location**: `extensions/catalog.community.json`
 - **Usage**: Reference catalog for discovering available extensions
-- **Submission**: Open to community contributions via Pull Request
+- **Submission**: Open to community contributions via [issue template](https://github.com/github/spec-kit/issues/new?template=extension_submission.yml)
 
 **How It Works:**
 
@@ -59,7 +62,7 @@ Populate your `catalog.json` with approved extensions:
 Skip catalog curation - team members install directly using URLs:
 
 ```bash
-specify extension add --from https://github.com/org/spec-kit-ext/archive/refs/tags/v1.0.0.zip
+specify extension add <extension-name> --from https://github.com/org/spec-kit-ext/archive/refs/tags/v1.0.0.zip
 ```
 
 **Benefits**: Quick for one-off testing or private extensions
@@ -68,21 +71,14 @@ specify extension add --from https://github.com/org/spec-kit-ext/archive/refs/ta
 
 ## Available Community Extensions
 
-The following community-contributed extensions are available in [`catalog.community.json`](catalog.community.json):
+> [!NOTE]
+> Community extensions are independently created and maintained by their respective authors. Maintainers only verify that catalog entries are complete and correctly formatted — they do **not review, audit, endorse, or support the extension code itself**. The Community Extensions website is also a third-party resource. Review extension source code before installation and use at your own discretion.
 
-| Extension | Purpose | URL |
-|-----------|---------|-----|
-| Azure DevOps Integration | Sync user stories and tasks to Azure DevOps work items using OAuth authentication | [spec-kit-azure-devops](https://github.com/pragya247/spec-kit-azure-devops) |
-| Cleanup Extension | Post-implementation quality gate that reviews changes, fixes small issues (scout rule), creates tasks for medium issues, and generates analysis for large issues | [spec-kit-cleanup](https://github.com/dsrednicki/spec-kit-cleanup) |
-| Fleet Orchestrator | Orchestrate a full feature lifecycle with human-in-the-loop gates across all SpecKit phases | [spec-kit-fleet](https://github.com/sharathsatish/spec-kit-fleet) |
-| Jira Integration | Create Jira Epics, Stories, and Issues from spec-kit specifications and task breakdowns with configurable hierarchy and custom field support | [spec-kit-jira](https://github.com/mbachorik/spec-kit-jira) |
-| Ralph Loop | Autonomous implementation loop using AI agent CLI | [spec-kit-ralph](https://github.com/Rubiss/spec-kit-ralph) |
-| Retrospective Extension | Post-implementation retrospective with spec adherence scoring, drift analysis, and human-gated spec updates | [spec-kit-retrospective](https://github.com/emi-dm/spec-kit-retrospective) |
-| Review Extension | Post-implementation comprehensive code review with specialized agents for code quality, comments, tests, error handling, type design, and simplification | [spec-kit-review](https://github.com/ismaelJimenez/spec-kit-review) |
-| Spec Sync | Detect and resolve drift between specs and implementation. AI-assisted resolution with human approval | [spec-kit-sync](https://github.com/bgervin/spec-kit-sync) |
-| Understanding | Automated requirements quality analysis — 31 deterministic metrics against IEEE/ISO standards with experimental energy-based ambiguity detection | [understanding](https://github.com/Testimonial/understanding) |
-| V-Model Extension Pack | Enforces V-Model paired generation of development specs and test specs with full traceability | [spec-kit-v-model](https://github.com/leocamello/spec-kit-v-model) |
-| Verify Extension | Post-implementation quality gate that validates implemented code against specification artifacts | [spec-kit-verify](https://github.com/ismaelJimenez/spec-kit-verify) |
+🔍 **Browse and search community extensions on the [Community Extensions website](https://speckit-community.github.io/extensions/).**
+
+See the [Community Extensions](../README.md#-community-extensions) section in the main README for the full list of available community-contributed extensions.
+
+For the raw catalog data, see [`catalog.community.json`](catalog.community.json).
 
 
 ## Adding Your Extension
@@ -93,10 +89,8 @@ To add your extension to the community catalog:
 
 1. **Prepare your extension** following the [Extension Development Guide](EXTENSION-DEVELOPMENT-GUIDE.md)
 2. **Create a GitHub release** for your extension
-3. **Submit a Pull Request** that:
-   - Adds your extension to `extensions/catalog.community.json`
-   - Updates this README with your extension in the Available Extensions table
-4. **Wait for review** - maintainers will review and merge if criteria are met
+3. **File an issue** using the [Extension Submission](https://github.com/github/spec-kit/issues/new?template=extension_submission.yml) template with all required metadata
+4. **Wait for review** — a maintainer will review the submission, update the catalog, and close the issue
 
 See the [Extension Publishing Guide](EXTENSION-PUBLISHING-GUIDE.md) for detailed step-by-step instructions.
 
@@ -120,7 +114,7 @@ specify extension search                  # See what's in your catalog
 specify extension add <extension-name>    # Install by name
 
 # Direct from URL (bypasses catalog)
-specify extension add --from https://github.com/<org>/<repo>/archive/refs/tags/<version>.zip
+specify extension add <extension-name> --from https://github.com/<org>/<repo>/archive/refs/tags/<version>.zip
 
 # List installed extensions
 specify extension list

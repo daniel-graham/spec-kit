@@ -44,7 +44,7 @@ provides:
     - name: string       # Required, pattern: ^speckit\.[a-z0-9-]+\.[a-z0-9-]+$
       file: string       # Required, relative path to command file
       description: string # Required
-      aliases: [string]  # Optional, array of alternate names
+      aliases: [string]  # Optional, same pattern as name; namespace must match extension.id and must not shadow core or installed extension commands
 
   config:                # Optional, array of config files
     - name: string       # Config file name
@@ -53,7 +53,7 @@ provides:
       required: boolean  # Default: false
 
 hooks:                   # Optional, event hooks
-  event_name:            # e.g., "after_tasks", "after_implement"
+  event_name:            # e.g., "after_specify", "after_plan", "after_tasks", "after_implement"
     command: string      # Command to execute
     optional: boolean    # Default: true
     prompt: string       # Prompt text for optional hooks
@@ -108,7 +108,7 @@ defaults:                # Optional, default configuration values
 #### `hooks`
 
 - **Type**: object
-- **Keys**: Event names (e.g., `after_tasks`, `after_implement`, `before_commit`)
+- **Keys**: Event names (e.g., `after_specify`, `after_plan`, `after_tasks`, `after_implement`, `before_analyze`)
 - **Description**: Hooks that execute at lifecycle events
 - **Events**: Defined by core spec-kit commands
 
@@ -551,10 +551,24 @@ hooks:
 
 Standard events (defined by core):
 
+- `before_specify` - Before specification generation
+- `after_specify` - After specification generation
+- `before_plan` - Before implementation planning
+- `after_plan` - After implementation planning
+- `before_tasks` - Before task generation
 - `after_tasks` - After task generation
+- `before_implement` - Before implementation
 - `after_implement` - After implementation
-- `before_commit` - Before git commit
-- `after_commit` - After git commit
+- `before_analyze` - Before cross-artifact analysis
+- `after_analyze` - After cross-artifact analysis
+- `before_checklist` - Before checklist generation
+- `after_checklist` - After checklist generation
+- `before_clarify` - Before spec clarification
+- `after_clarify` - After spec clarification
+- `before_constitution` - Before constitution update
+- `after_constitution` - After constitution update
+- `before_taskstoissues` - Before tasks-to-issues conversion
+- `after_taskstoissues` - After tasks-to-issues conversion
 
 ### Hook Configuration
 
