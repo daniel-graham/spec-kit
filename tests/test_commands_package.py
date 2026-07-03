@@ -16,16 +16,26 @@ def test_commands_init_importable():
 def test_agent_config_importable():
     from specify_cli._agent_config import (
         AGENT_CONFIG,
-        AI_ASSISTANT_ALIASES,
-        AI_ASSISTANT_HELP,
         DEFAULT_INIT_INTEGRATION,
         SCRIPT_TYPE_CHOICES,
     )
     assert isinstance(AGENT_CONFIG, dict)
-    assert isinstance(AI_ASSISTANT_ALIASES, dict)
-    assert isinstance(AI_ASSISTANT_HELP, str)
     assert DEFAULT_INIT_INTEGRATION == "copilot"
     assert "sh" in SCRIPT_TYPE_CHOICES
+
+
+def test_script_type_choices_includes_python():
+    from specify_cli._agent_config import SCRIPT_TYPE_CHOICES
+    assert SCRIPT_TYPE_CHOICES.get("py") == "Python"
+    # The three supported variants are sh, ps, and py.
+    assert {"sh", "ps", "py"} <= set(SCRIPT_TYPE_CHOICES)
+
+
+def test_workflow_init_valid_script_types_includes_python():
+    from specify_cli.workflows.steps.init import VALID_SCRIPT_TYPES
+    assert "py" in VALID_SCRIPT_TYPES
+    # Negative: an unknown variant is not accepted.
+    assert "rb" not in VALID_SCRIPT_TYPES
 
 
 def test_agent_config_re_exported_from_init():
