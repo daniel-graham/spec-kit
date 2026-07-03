@@ -22,7 +22,7 @@ class CursorAgentIntegration(SkillsIntegration):
         "folder": ".cursor/",
         "commands_subdir": "skills",
         "install_url": "https://docs.cursor.com/en/cli/overview",
-        # IDE-first integration: ``specify init --ai cursor-agent`` must
+        # IDE-first integration: ``specify init --integration cursor-agent`` must
         # work without the ``cursor-agent`` CLI installed (the IDE flow
         # uses skills directly).  Workflow dispatch additionally requires
         # the CLI on PATH, but that's enforced at dispatch time via
@@ -36,7 +36,6 @@ class CursorAgentIntegration(SkillsIntegration):
         "extension": "/SKILL.md",
     }
 
-    context_file = ".cursor/rules/specify-rules.mdc"
     multi_install_safe = True
 
     def build_exec_args(
@@ -76,7 +75,15 @@ class CursorAgentIntegration(SkillsIntegration):
         either drops tool calls or exits non-zero on the first approval
         prompt.
         """
-        args = [self.key, "-p", "--trust", "--approve-mcps", "--force", prompt]
+        args = [
+            self._resolve_executable(),
+            "-p",
+            "--trust",
+            "--approve-mcps",
+            "--force",
+            prompt,
+        ]
+        self._apply_extra_args_env_var(args)
         if model:
             args.extend(["--model", model])
         if output_json:

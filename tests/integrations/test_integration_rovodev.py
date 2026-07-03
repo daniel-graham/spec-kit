@@ -25,8 +25,7 @@ def _run_init(project, *flags: str) -> Result:
         os.chdir(project)
         return CliRunner().invoke(
             app,
-            ["init", "--here", *flags, "--script", "sh",
-             "--no-git", "--ignore-agent-tools"],
+            ["init", "--here", *flags, "--script", "sh", "--ignore-agent-tools"],
             catch_exceptions=False,
         )
     finally:
@@ -53,7 +52,6 @@ class TestRovodevIntegration:
     which violates the base mixin's pure-skills assumptions)."""
 
     KEY = "rovodev"
-    CONTEXT_FILE = "AGENTS.md"
 
     # -- ACLI dispatch -----------------------------------------------------
 
@@ -219,12 +217,8 @@ class TestRovodevIntegration:
         # Prompts: exactly the core template set.
         assert prompt_stems == core_skill_names
 
-        # Skills: core ∪ extension-installed.
-        assert core_skill_names.issubset(skill_names)
-        extension_skills = skill_names - core_skill_names
-        assert extension_skills, (
-            "Expected at least one extension-installed skill (e.g. agent-context)"
-        )
+        # Skills: exactly the core template set (no extension auto-install).
+        assert skill_names == core_skill_names
 
         # prompts.yml mirrors the prompt files exactly.
         prompts_manifest = project / ".rovodev" / "prompts.yml"
@@ -267,10 +261,6 @@ class TestRovodevIntegration:
                 f"{skill_file} body contains dot-notation /speckit. reference"
             )
 
-        # The plan skill must reference the agent's context file.
-        plan_content = (skills_dir / "speckit-plan" / "SKILL.md").read_text(encoding="utf-8")
-        assert self.CONTEXT_FILE in plan_content
-
     # -- Full-CLI init: integration metadata -------------------------------
 
     def test_init_writes_integration_manifest_and_options(self, rovodev_init_project):
@@ -294,11 +284,11 @@ class TestRovodevIntegration:
         assert init_options.get("ai_skills") is True
         assert init_options.get("script") == "sh"
 
-    def test_ai_flag_auto_promotes_to_integration(self, tmp_path):
-        """``--ai rovodev`` should reach the same end-state as ``--integration rovodev``."""
-        project = tmp_path / "rovodev-ai"
+    def test_integration_flag_creates_expected_files(self, tmp_path):
+        """``--integration rovodev`` should create all expected rovodev files."""
+        project = tmp_path / "rovodev-int"
         project.mkdir()
-        result = _run_init(project, "--ai", "rovodev")
+        result = _run_init(project, "--integration", "rovodev")
         assert result.exit_code == 0, result.output
         assert (project / ".rovodev" / "skills" / "speckit-plan" / "SKILL.md").exists()
         assert (project / ".rovodev" / "prompts.yml").exists()

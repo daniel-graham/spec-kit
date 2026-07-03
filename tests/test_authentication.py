@@ -793,6 +793,35 @@ class TestRedirectStripping:
         assert new_req.headers.get("Authorization") is None
         assert new_req.unredirected_hdrs.get("Authorization") is None
 
+    def test_https_to_http_same_host_redirect_strips_auth(self):
+        from specify_cli.authentication.http import _StripAuthOnRedirect
+        from urllib.request import Request
+        import io
+        handler = _StripAuthOnRedirect(("github.com",))
+        req = Request("https://github.com/org/repo", headers={"Authorization": "Bearer tok"})
+        new_req = handler.redirect_request(req, io.BytesIO(b""), 302, "Found", {},
+                                           "http://github.com/org/repo")
+        assert new_req is not None
+        assert new_req.headers.get("Authorization") is None
+        assert new_req.unredirected_hdrs.get("Authorization") is None
+
+    def test_redirect_validator_can_reject_before_following_redirect(self):
+        import urllib.error
+        from specify_cli.authentication.http import _StripAuthOnRedirect
+        from urllib.request import Request
+        import io
+
+        def reject_http(old_url, new_url):
+            if new_url.startswith("http://"):
+                raise urllib.error.URLError("scheme downgrade")
+
+        handler = _StripAuthOnRedirect(("github.com",), reject_http)
+        req = Request("https://github.com/org/repo", headers={"Authorization": "Bearer tok"})
+
+        with pytest.raises(urllib.error.URLError, match="scheme downgrade"):
+            handler.redirect_request(req, io.BytesIO(b""), 302, "Found", {},
+                                     "http://github.com/org/repo")
+
     def test_multi_hop_redirect_within_hosts_preserves_auth(self):
         """Auth survives a multi-hop redirect chain within allowed hosts."""
         from specify_cli.authentication.http import _StripAuthOnRedirect
@@ -871,3 +900,45 @@ class TestFetchLatestReleaseTagDelegation:
         with patch("specify_cli.authentication.http.urllib.request.urlopen", side_effect=side_effect):
             _fetch_latest_release_tag()
         assert captured["request"].get_header("Accept") == "application/vnd.github+json"
+
+
+# ---------------------------------------------------------------------------
+# github_provider_hosts
+# ---------------------------------------------------------------------------
+
+
+class TestGithubProviderHosts:
+    """Tests for github_provider_hosts() — the GHES host allowlist source."""
+
+    def _set_config(self, monkeypatch, entries):
+        from specify_cli.authentication import http as _auth_http
+        monkeypatch.setattr(_auth_http, "_config_override", entries)
+
+    def test_returns_hosts_from_github_entries(self, monkeypatch):
+        from specify_cli.authentication.http import github_provider_hosts
+        self._set_config(monkeypatch, [
+            AuthConfigEntry(hosts=("ghes.example", "raw.ghes.example"),
+                            provider="github", auth="bearer", token="t"),
+        ])
+        assert github_provider_hosts() == ("ghes.example", "raw.ghes.example")
+
+    def test_empty_when_no_config(self, monkeypatch):
+        from specify_cli.authentication.http import github_provider_hosts
+        self._set_config(monkeypatch, [])
+        assert github_provider_hosts() == ()
+
+    def test_ignores_non_github_providers(self, monkeypatch):
+        from specify_cli.authentication.http import github_provider_hosts
+        self._set_config(monkeypatch, [
+            AuthConfigEntry(hosts=("dev.azure.com",), provider="azure-devops",
+                            auth="basic-pat", token="t"),
+        ])
+        assert github_provider_hosts() == ()
+
+    def test_unions_multiple_github_entries(self, monkeypatch):
+        from specify_cli.authentication.http import github_provider_hosts
+        self._set_config(monkeypatch, [
+            AuthConfigEntry(hosts=("ghes.example",), provider="github", auth="bearer", token="t"),
+            AuthConfigEntry(hosts=("github.com",), provider="github", auth="bearer", token="t"),
+        ])
+        assert github_provider_hosts() == ("ghes.example", "github.com")
