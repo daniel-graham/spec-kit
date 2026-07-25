@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import typer
+from rich.markup import escape
 
 from .._agent_config import SCRIPT_TYPE_CHOICES
 from .._console import console
@@ -190,7 +191,15 @@ def _parse_integration_options(integration: Any, raw_options: str) -> dict[str, 
     """
     import shlex
     parsed: dict[str, Any] = {}
-    tokens = shlex.split(raw_options)
+    try:
+        tokens = shlex.split(raw_options)
+    except ValueError as exc:
+        # An unbalanced quote (e.g. --integration-options='--commands-dir "foo')
+        # makes shlex raise "No closing quotation". Translate it into the same
+        # clean exit-1 UX as every other bad-input path below rather than
+        # letting a raw traceback escape.
+        console.print(f"[red]Error:[/red] Could not parse integration options: {exc}.")
+        raise typer.Exit(1)
     declared_options = list(integration.options())
     declared = {opt.name.lstrip("-"): opt for opt in declared_options}
     allowed = ", ".join(sorted(opt.name for opt in declared_options))
@@ -198,7 +207,7 @@ def _parse_integration_options(integration: Any, raw_options: str) -> dict[str, 
     while i < len(tokens):
         token = tokens[i]
         if not token.startswith("-"):
-            console.print(f"[red]Error:[/red] Unexpected integration option value '{token}'.")
+            console.print(f"[red]Error:[/red] Unexpected integration option value '{escape(token)}'.")
             if allowed:
                 console.print(f"Allowed options: {allowed}")
             raise typer.Exit(1)
@@ -209,7 +218,7 @@ def _parse_integration_options(integration: Any, raw_options: str) -> dict[str, 
             name, value = name.split("=", 1)
         opt = declared.get(name)
         if not opt:
-            console.print(f"[red]Error:[/red] Unknown integration option '{token}'.")
+            console.print(f"[red]Error:[/red] Unknown integration option '{escape(token)}'.")
             if allowed:
                 console.print(f"Allowed options: {allowed}")
             raise typer.Exit(1)
@@ -252,6 +261,7 @@ def _update_init_options_for_integration(
     project_root: Path,
     integration: Any,
     script_type: str | None = None,
+    parsed_options: dict[str, Any] | None = None,
 ) -> None:
     """Update init-options.json to reflect *integration* as the active one.
 
@@ -263,14 +273,19 @@ def _update_init_options_for_integration(
         load_init_options,
         save_init_options,
     )
-    from .base import SkillsIntegration
     opts = load_init_options(project_root)
     opts["integration"] = integration.key
     opts["ai"] = integration.key
     opts["speckit_version"] = _get_speckit_version()
     if script_type:
         opts["script"] = script_type
-    if isinstance(integration, SkillsIntegration) or getattr(integration, "_skills_mode", False):
+    # Whether skills mode is active is owned by each integration via the
+    # ``is_skills_mode`` hook (base default honors ``--skills``;
+    # SkillsIntegration returns True; skills-first integrations with a legacy
+    # opt-out such as Bob override it). This keeps shared code free of
+    # ``isinstance`` / ``_skills_mode`` probing. Passing parsed_options lets it
+    # work on the ``use``/``install`` path where no setup() runs (issue #3550).
+    if integration.is_skills_mode(parsed_options, project_root=project_root):
         opts["ai_skills"] = True
     else:
         opts.pop("ai_skills", None)
@@ -306,6 +321,7 @@ def _set_default_integration(
         script_type=resolved_script,
         raw_options=raw_options,
         parsed_options=parsed_options,
+        project_root=project_root,
     )
 
     if refresh_templates:
@@ -314,7 +330,8 @@ def _set_default_integration(
                 project_root,
                 resolved_script,
                 invoke_separator=_invoke_separator_for_integration(
-                    integration, {"integration_settings": settings}, key, parsed_options
+                    integration, {"integration_settings": settings}, key, parsed_options,
+                    project_root=project_root,
                 ),
                 force=refresh_templates_force,
                 refresh_managed=True,
@@ -326,7 +343,9 @@ def _set_default_integration(
             ) from exc
 
     _write_integration_json(project_root, key, installed_keys, settings)
-    _update_init_options_for_integration(project_root, integration, script_type=resolved_script)
+    _update_init_options_for_integration(
+        project_root, integration, script_type=resolved_script, parsed_options=parsed_options
+    )
 
 
 def _set_default_integration_or_exit(*args: Any, **kwargs: Any) -> None:
@@ -420,6 +439,26 @@ def _unregister_extensions_for_agent(
         agent_key,
         lambda mgr, key: mgr.unregister_agent_artifacts(key),
         phase="clean up extension artifacts for",
+        continuing=continuing,
+    )
+
+
+def _unregister_enabled_extension_commands_for_agent(
+    project_root: Path,
+    agent_key: str,
+    *,
+    continuing: str,
+) -> None:
+    """Best-effort removal of enabled extension command artifacts for ``agent_key``."""
+    _best_effort_extension_op(
+        project_root,
+        agent_key,
+        lambda mgr, key: mgr.unregister_agent_artifacts(
+            key,
+            enabled_only=True,
+            commands_only=True,
+        ),
+        phase="clean up enabled extension command artifacts for",
         continuing=continuing,
     )
 

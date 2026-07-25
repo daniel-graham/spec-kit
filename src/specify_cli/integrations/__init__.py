@@ -58,11 +58,13 @@ def _register_builtins() -> None:
     from .copilot import CopilotIntegration
     from .cursor_agent import CursorAgentIntegration
     from .devin import DevinIntegration
+    from .droid import DroidIntegration
     from .firebender import FirebenderIntegration
     from .forge import ForgeIntegration
     from .gemini import GeminiIntegration
     from .generic import GenericIntegration
     from .goose import GooseIntegration
+    from .grok import GrokIntegration
     from .hermes import HermesIntegration
     from .junie import JunieIntegration
     from .kilocode import KilocodeIntegration
@@ -94,11 +96,13 @@ def _register_builtins() -> None:
     _register(CopilotIntegration())
     _register(CursorAgentIntegration())
     _register(DevinIntegration())
+    _register(DroidIntegration())
     _register(FirebenderIntegration())
     _register(ForgeIntegration())
     _register(GeminiIntegration())
     _register(GenericIntegration())
     _register(GooseIntegration())
+    _register(GrokIntegration())
     _register(HermesIntegration())
     _register(JunieIntegration())
     _register(KilocodeIntegration())

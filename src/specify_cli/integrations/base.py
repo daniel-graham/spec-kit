@@ -14,9 +14,11 @@ Provides:
 from __future__ import annotations
 
 import os
+import platform
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 from abc import ABC
 from dataclasses import dataclass
@@ -24,6 +26,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
+
+from .._toml_string import escape_toml_basic as _escape_toml_basic
+from .._toml_string import has_illegal_toml_control as _has_illegal_toml_control
 
 if TYPE_CHECKING:
     from .manifest import IntegrationManifest
@@ -49,6 +54,18 @@ _CORE_COMMAND_TEMPLATE_ORDER = (
 _CORE_COMMAND_TEMPLATE_RANK = {
     command: index for index, command in enumerate(_CORE_COMMAND_TEMPLATE_ORDER)
 }
+
+
+def yaml_quote(value: str) -> str:
+    """Emit *value* as a double-quoted YAML scalar on a single line.
+
+    A hand-rolled quote cannot carry raw newlines (YAML folds them to
+    spaces) or control characters (the reader rejects them), so let the
+    YAML emitter produce the escapes.
+    """
+    return yaml.safe_dump(
+        str(value), default_style='"', allow_unicode=True, width=sys.maxsize
+    ).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +140,19 @@ class IntegrationBase(ABC):
     integration that sets this flag.
     """
 
+    def post_process_command_content(self, content: str) -> str:
+        """Transform command content after format rendering.
+
+        Called by ``register_commands()`` for non-skills format types
+        (Markdown, TOML, YAML) after the command has been rendered into
+        its target format and before writing to disk.  Skills-format
+        agents use ``post_process_skill_content()`` instead.
+
+        Subclasses may override to inject agent-specific content.
+        The default implementation returns *content* unchanged.
+        """
+        return content
+
     # -- Public API -------------------------------------------------------
 
     @classmethod
@@ -131,16 +161,65 @@ class IntegrationBase(ABC):
         return []
 
     def effective_invoke_separator(
-        self, parsed_options: dict[str, Any] | None = None
+        self,
+        parsed_options: dict[str, Any] | None = None,
+        project_root: Path | None = None,
     ) -> str:
         """Return the invoke separator for the given options.
 
         Subclasses whose separator depends on runtime options (e.g.
         Copilot in ``--skills`` mode) should override this method.
-        The default implementation ignores *parsed_options* and returns
-        the class-level ``invoke_separator``.
+        The default implementation ignores *parsed_options* and
+        *project_root* and returns the class-level ``invoke_separator``.
         """
         return self.invoke_separator
+
+    def invoke_separator_for_mode(self, skills_enabled: bool) -> str:
+        """Command-ref separator given the project's *resolved* skills state.
+
+        Registration paths (extension / preset command rendering) have no CLI
+        ``parsed_options`` — only the persisted ``ai_skills`` flag — so they
+        resolve the command-reference separator through this hook rather than
+        the static ``AGENT_CONFIGS[key]["invoke_separator"]`` value, which
+        cannot represent an agent whose separator differs between its skills
+        and command layouts.
+
+        The default is mode-independent and returns exactly what
+        ``_build_agent_configs`` would place in ``AGENT_CONFIGS`` (the
+        ``registrar_config`` override if present, else the class-level
+        ``invoke_separator``), so single-layout agents are unaffected.
+        Dual-mode agents whose separator depends on the layout (e.g. Bob:
+        ``-`` for skills, ``.`` for legacy commands) override this.
+        """
+        cfg = self.registrar_config or {}
+        return cfg.get("invoke_separator", self.invoke_separator)
+
+    def is_skills_mode(
+        self,
+        parsed_options: dict[str, Any] | None = None,
+        project_root: Path | None = None,
+    ) -> bool:
+        """Return whether this integration scaffolds skills for these options.
+
+        This is the single, well-defined hook the shared init/install/upgrade
+        machinery consults to decide whether to persist ``ai_skills=True`` and
+        render skill invocations.  It replaces ad-hoc ``isinstance`` /
+        ``getattr(self, "_skills_mode", ...)`` probing so an integration's
+        internal representation never has to leak into shared dispatch code.
+
+        *project_root* is optional context for the ``use`` / ``switch`` /
+        ``upgrade`` path, where no ``setup()`` runs and *parsed_options* may be
+        empty: dual-mode integrations can consult the already-installed
+        on-disk layout to avoid silently migrating an existing project to a
+        different mode.  The default ignores it.
+
+        The default (command-first integrations, e.g. Copilot's default
+        layout) is skills mode only when ``--skills`` was requested.
+        ``SkillsIntegration`` overrides this to return ``True`` by default;
+        skills-first integrations that expose a legacy opt-out (e.g. Bob)
+        override it to honor their own flag.
+        """
+        return bool((parsed_options or {}).get("skills"))
 
     def build_exec_args(
         self,
@@ -576,9 +655,81 @@ class IntegrationBase(ABC):
                 if candidate.exists():
                     return relative
         for name in ("python3", "python"):
-            if shutil.which(name):
-                return name
+            found = shutil.which(name)
+            if not found:
+                continue
+            # On Windows, python3/python on PATH may be the Microsoft
+            # Store App Execution Alias stub: it exists but only prints
+            # an installer hint and exits non-zero, so existence is not
+            # enough (see #3304 for the same defect in the sh scripts).
+            if sys.platform == "win32" and not IntegrationBase._interpreter_runs(
+                found
+            ):
+                continue
+            return name
         return sys.executable or "python3"
+
+    @staticmethod
+    def build_python_invocation(
+        script_command: str, project_root: Path | None = None
+    ) -> str:
+        """Build a Python script command for the current platform shell."""
+        interpreter = IntegrationBase.resolve_python_interpreter(project_root)
+        if os.name == "nt" and not re.fullmatch(r"[A-Za-z0-9_./:\\-]+", interpreter):
+            quoted_interpreter = interpreter.replace("'", "''")
+            interpreter = f"& '{quoted_interpreter}'"
+        elif os.name != "nt":
+            interpreter = shlex.quote(interpreter)
+        return f"{interpreter} {script_command}"
+
+    @staticmethod
+    def select_script_variant(
+        requested: object, script_commands: dict[str, str]
+    ) -> str:
+        """Select the requested variant or a runnable platform fallback."""
+        if isinstance(requested, str) and requested in script_commands:
+            return requested
+
+        platform_variant = (
+            "ps" if platform.system().lower().startswith("win") else "sh"
+        )
+        secondary_variant = "sh" if platform_variant == "ps" else "ps"
+        fallbacks = (
+            (platform_variant, "py")
+            if requested == "py"
+            else (platform_variant, secondary_variant, "py")
+        )
+        for candidate in fallbacks:
+            if candidate in script_commands:
+                return candidate
+
+        available = ", ".join(sorted(script_commands)) or "none"
+        raise ValueError(
+            "No runnable script variant for this platform: "
+            f"requested {requested!r}; available: {available}"
+        )
+
+    @staticmethod
+    def _interpreter_runs(path: str) -> bool:
+        """Return True when *path* executes as a Python interpreter.
+
+        Runs isolated (``-I``) without ``site`` (``-S``) and discards
+        I/O so the probe is a fast liveness check that cannot trigger
+        ``sitecustomize``/user startup hooks.
+        """
+        try:
+            return (
+                subprocess.run(
+                    [path, "-I", "-S", "-c", ""],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                ).returncode
+                == 0
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     @staticmethod
     def process_template(
@@ -592,7 +743,8 @@ class IntegrationBase(ABC):
         """Process a raw command template into agent-ready content.
 
         Performs the same transformations as the release script:
-        1. Extract ``scripts.<script_type>`` value from YAML frontmatter
+        1. Select ``scripts.<script_type>`` from YAML frontmatter, falling
+           back to a runnable platform shell or Python variant when unavailable
         2. Replace ``{SCRIPT}`` with the extracted script command
         3. Strip ``scripts:`` section from frontmatter
         4. Replace ``{ARGS}`` and ``$ARGUMENTS`` with *arg_placeholder*
@@ -601,37 +753,46 @@ class IntegrationBase(ABC):
         7. Replace ``__SPECKIT_COMMAND_<NAME>__`` with invocation strings
         """
         # 1. Extract script command from frontmatter
-        script_command = ""
-        script_pattern = re.compile(
-            rf"^\s*{re.escape(script_type)}:\s*(.+)$", re.MULTILINE
-        )
+        script_commands: dict[str, str] = {}
+        script_pattern = re.compile(r"^\s*([A-Za-z0-9_-]+):\s*(.+)$")
         # Find the scripts: block
+        in_frontmatter = False
         in_scripts = False
         for line in content.splitlines():
-            if line.strip() == "scripts:":
+            if line == "---":
+                if in_frontmatter:
+                    break
+                in_frontmatter = True
+                continue
+            if not in_frontmatter:
+                continue
+            if line == "scripts:":
                 in_scripts = True
                 continue
             if in_scripts and line and not line[0].isspace():
-                in_scripts = False
+                break
             if in_scripts:
                 m = script_pattern.match(line)
                 if m:
-                    script_command = m.group(1).strip()
-                    break
+                    script_commands[m.group(1)] = m.group(2).strip()
+
+        selected_script_type = (
+            IntegrationBase.select_script_variant(script_type, script_commands)
+            if script_commands
+            else ""
+        )
+
+        script_command = script_commands.get(selected_script_type, "")
 
         # 2. Replace {SCRIPT}
         if script_command:
             # For the Python script type, prefix the resolved interpreter so
             # the command is portable (``.py`` files are not directly
             # executable on Windows).
-            if script_type == "py":
-                interpreter = IntegrationBase.resolve_python_interpreter(project_root)
-                # Quote the interpreter if it contains whitespace (e.g. an
-                # absolute ``sys.executable`` path under Windows
-                # ``Program Files``) so it isn't split into multiple args.
-                if any(ch.isspace() for ch in interpreter):
-                    interpreter = f'"{interpreter}"'
-                script_command = f"{interpreter} {script_command}"
+            if selected_script_type == "py":
+                script_command = IntegrationBase.build_python_invocation(
+                    script_command, project_root
+                )
             content = content.replace("{SCRIPT}", script_command)
 
         # 3. Strip scripts: section from frontmatter
@@ -940,6 +1101,12 @@ class TomlIntegration(IntegrationBase):
         body = "".join(lines[frontmatter_end + 1 :])
         return frontmatter, body
 
+    # Control-char detection and basic-string escaping are shared with the
+    # extension/preset renderer in ``specify_cli.agents`` via
+    # ``specify_cli._toml_string`` so the two never drift apart.
+    _has_illegal_toml_control = staticmethod(_has_illegal_toml_control)
+    _escape_toml_basic = staticmethod(_escape_toml_basic)
+
     @staticmethod
     def _render_toml_string(value: str) -> str:
         """Render *value* as a TOML string literal.
@@ -949,6 +1116,12 @@ class TomlIntegration(IntegrationBase):
         literal string or escaped basic string when delimiters appear in
         the content.
         """
+        # Control characters other than tab/newline (and a bare CR) cannot
+        # appear literally in any TOML string; route them to a fully-escaped
+        # basic string so the generated file stays parseable.
+        if TomlIntegration._has_illegal_toml_control(value):
+            return TomlIntegration._escape_toml_basic(value)
+
         if "\n" not in value and "\r" not in value:
             escaped = value.replace("\\", "\\\\").replace('"', '\\"')
             return f'"{escaped}"'
@@ -961,17 +1134,7 @@ class TomlIntegration(IntegrationBase):
         if "'''" not in value and not value.endswith("'"):
             return "'''\n" + value + "'''"
 
-        return (
-            '"'
-            + (
-                value.replace("\\", "\\\\")
-                .replace('"', '\\"')
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t")
-            )
-            + '"'
-        )
+        return TomlIntegration._escape_toml_basic(value)
 
     @staticmethod
     def _render_toml(description: str, body: str) -> str:
@@ -1058,6 +1221,16 @@ class TomlIntegration(IntegrationBase):
 # ---------------------------------------------------------------------------
 # YamlIntegration — YAML-format agents (Goose)
 # ---------------------------------------------------------------------------
+
+# Characters a YAML literal block scalar cannot carry: C0 controls other
+# than tab/LF (a bare CR acts as a line break inside the scalar), DEL, the
+# C1 range, lone UTF-16 surrogates, and the non-characters U+FFFE/U+FFFF.
+# NEL (U+0085) is YAML-printable but, like LS/PS (U+2028/U+2029), YAML 1.1
+# treats it as a line break, which corrupts the block scalar's structure
+# just the same, so all three are included.
+_YAML_BLOCK_SCALAR_UNSAFE = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff\ufffe\uffff]"
+)
 
 
 class YamlIntegration(IntegrationBase):
@@ -1165,9 +1338,9 @@ class YamlIntegration(IntegrationBase):
     def _render_yaml(cls, title: str, description: str, body: str, source_id: str) -> str:
         """Render a YAML recipe file from title, description, and body.
 
-        Produces a Goose-compatible recipe with a literal block scalar
-        for the prompt content.  Uses ``yaml.safe_dump()`` for the
-        header fields to ensure proper escaping.
+        Produces a Goose-compatible recipe with a literal block scalar for
+        normal prompt content, or an escaped quoted scalar when control
+        characters require it. Uses ``yaml.safe_dump()`` for the header fields.
         """
         header = cls._build_yaml_header(title, description)
 
@@ -1178,12 +1351,35 @@ class YamlIntegration(IntegrationBase):
             default_flow_style=False,
         ).strip()
 
-        # Indent the body for YAML block scalar
+        # YAML forbids C0 control characters (except tab and newline) and
+        # DEL in every scalar form, and a bare CR acts as a line break
+        # inside a block scalar. A literal block scalar emits such bytes
+        # verbatim, producing a recipe the YAML parser rejects, so fall
+        # back to an escaped double-quoted scalar for those bodies.
+        if _YAML_BLOCK_SCALAR_UNSAFE.search(body):
+            prompt_yaml = yaml.safe_dump(
+                {"prompt": body}, allow_unicode=True, default_style='"', width=sys.maxsize
+            ).strip()
+            lines = [
+                header_yaml,
+                prompt_yaml,
+                "",
+                f"# Source: {source_id}",
+            ]
+            return "\n".join(lines) + "\n"
+
+        # Indent the body for YAML block scalar. Use an explicit indentation
+        # indicator ("|2") rather than a bare "|": YAML infers a plain block
+        # scalar's indentation from its first non-empty line, so a body whose
+        # first line is itself indented (e.g. a markdown code block or a nested
+        # list item) would make the parser expect that deeper indent for the
+        # whole block and reject the later, less-indented lines. Pinning the
+        # indent to 2 keeps the recipe parseable whatever the body looks like.
         indented = "\n".join(f"  {line}" for line in body.split("\n"))
 
         lines = [
             header_yaml,
-            "prompt: |",
+            "prompt: |2",
             indented,
             "",
             f"# Source: {source_id}",
@@ -1279,6 +1475,14 @@ class SkillsIntegration(IntegrationBase):
     """
 
     invoke_separator = "-"
+
+    def is_skills_mode(
+        self,
+        parsed_options: dict[str, Any] | None = None,
+        project_root: Path | None = None,
+    ) -> bool:
+        """Skills-native integrations scaffold skills unconditionally."""
+        return True
 
     def build_exec_args(
         self,
@@ -1456,21 +1660,17 @@ class SkillsIntegration(IntegrationBase):
             if not description:
                 description = f"Spec Kit: {command_name} workflow"
 
-            # Build SKILL.md with manually formatted frontmatter to match
-            # the release packaging script output exactly (double-quoted
-            # values, no yaml.safe_dump quoting differences).
-            def _quote(v: str) -> str:
-                escaped = v.replace("\\", "\\\\").replace('"', '\\"')
-                return f'"{escaped}"'
-
+            # Build SKILL.md with manually formatted frontmatter (stable
+            # double-quoted values). yaml_quote escapes newlines and control
+            # characters that a plain quoted f-string cannot carry.
             skill_content = (
                 f"---\n"
-                f"name: {_quote(skill_name)}\n"
-                f"description: {_quote(description)}\n"
-                f"compatibility: {_quote('Requires spec-kit project structure with .specify/ directory')}\n"
+                f"name: {yaml_quote(skill_name)}\n"
+                f"description: {yaml_quote(description)}\n"
+                f"compatibility: {yaml_quote('Requires spec-kit project structure with .specify/ directory')}\n"
                 f"metadata:\n"
-                f"  author: {_quote('github-spec-kit')}\n"
-                f"  source: {_quote('templates/commands/' + src_file.name)}\n"
+                f"  author: {yaml_quote('github-spec-kit')}\n"
+                f"  source: {yaml_quote('templates/commands/' + src_file.name)}\n"
                 f"---\n"
                 f"{processed_body}"
             )
