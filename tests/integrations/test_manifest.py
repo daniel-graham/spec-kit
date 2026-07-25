@@ -220,6 +220,28 @@ class TestManifestUninstall:
         m.uninstall()
         assert not m.manifest_path.exists()
 
+    def test_remove_manifest_false_preserves_manifest_file(self, tmp_path):
+        """Regression (review #3415, 4724160183): a partial cleanup must not
+        delete ``{key}.manifest.json``.
+
+        The upgrade stale-file pass builds a throwaway manifest sharing the
+        integration's key over a subset of files and uninstalls it.  With
+        ``remove_manifest=False`` the tracked files are still removed but the
+        real, freshly-saved manifest for that key survives — otherwise a
+        layout-shrinking upgrade (e.g. Bob migrating legacy commands → skills)
+        would leave the integration untracked and un-upgradeable.
+        """
+        m = IntegrationManifest("test", tmp_path, version="1.0")
+        m.record_file("f.txt", "content")
+        m.save()
+        assert m.manifest_path.exists()
+        removed, skipped = m.uninstall(remove_manifest=False)
+        assert len(removed) == 1
+        assert not (tmp_path / "f.txt").exists()
+        assert m.manifest_path.exists(), (
+            "remove_manifest=False must keep the manifest file on disk"
+        )
+
     def test_cleans_empty_parent_dirs(self, tmp_path):
         m = IntegrationManifest("test", tmp_path)
         m.record_file("a/b/c/f.txt", "content")
@@ -481,3 +503,40 @@ class TestRecordExistingNewGuards:
         m = IntegrationManifest("test", tmp_path)
         with pytest.raises(ValueError, match=r"canonical|'\.\.' segments"):
             m.record_existing("dir/../file.txt")
+
+
+class TestManifestUnreadableFile:
+    """A managed file that is unreadable (e.g. PermissionError) must not crash
+    check_modified()/uninstall() — the CLI handlers surfaced a raw traceback."""
+
+    def _mk(self, tmp_path):
+        m = IntegrationManifest("test", tmp_path)
+        m.record_file("sub/f.md", "content")
+        return m
+
+    def test_check_modified_treats_unreadable_as_modified(self, tmp_path, monkeypatch):
+        m = self._mk(tmp_path)
+
+        def raise_perm(_path):
+            raise PermissionError("unreadable")
+
+        monkeypatch.setattr(
+            "specify_cli.integrations.manifest._sha256", raise_perm
+        )
+        # Before the fix this raised PermissionError.
+        assert m.check_modified() == ["sub/f.md"]
+
+    def test_uninstall_preserves_unreadable_file(self, tmp_path, monkeypatch):
+        m = self._mk(tmp_path)
+
+        def raise_perm(_path):
+            raise PermissionError("unreadable")
+
+        monkeypatch.setattr(
+            "specify_cli.integrations.manifest._sha256", raise_perm
+        )
+        removed, skipped = m.uninstall(force=False)
+        # Can't verify ownership => preserve, don't crash and don't delete.
+        assert removed == []
+        assert (tmp_path / "sub" / "f.md") in skipped
+        assert (tmp_path / "sub" / "f.md").exists()

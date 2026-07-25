@@ -13,8 +13,13 @@ from pathlib import Path
 
 import typer
 import yaml
+from rich.markup import escape as _escape_markup
 
 from .._console import console
+from .._download_security import (
+    is_https_or_localhost_http,
+    is_safe_download_redirect,
+)
 
 preset_app = typer.Typer(
     name="preset",
@@ -101,41 +106,32 @@ def preset_add(
 
         elif from_url:
             # Validate URL scheme before downloading
-            from ipaddress import ip_address
             from urllib.parse import urlparse as _urlparse
 
-            _parsed = _urlparse(from_url)
-
-            def _is_allowed_download_url(parsed_url):
-                host = parsed_url.hostname
-                if not host:
-                    return False
-                is_loopback = host == "localhost"
-                if not is_loopback:
-                    try:
-                        is_loopback = ip_address(host).is_loopback
-                    except ValueError:
-                        # Host is not an IP literal (e.g., a regular hostname); treat as non-loopback.
-                        pass
-                return parsed_url.scheme == "https" or (parsed_url.scheme == "http" and is_loopback)
+            try:
+                _parsed = _urlparse(from_url)
+                _parsed.port
+            except ValueError:
+                console.print(f"[red]Error:[/red] Invalid URL: {_escape_markup(from_url)}")
+                raise typer.Exit(1)
 
             def _validate_download_redirect(old_url, new_url):
-                if not _is_allowed_download_url(_urlparse(new_url)):
+                if not is_safe_download_redirect(old_url, new_url):
                     import urllib.error
 
                     raise urllib.error.URLError(
-                        "redirect target must use HTTPS with a hostname, "
-                        "or HTTP for localhost/loopback"
+                        "redirect target must use HTTPS without entering a local "
+                        "target, or stay within loopback over HTTP"
                     )
 
-            if not _is_allowed_download_url(_parsed):
+            if not is_https_or_localhost_http(from_url):
                 console.print(
                     "[red]Error:[/red] URL must use HTTPS with a hostname, "
                     "or HTTP for localhost/loopback."
                 )
                 raise typer.Exit(1)
 
-            console.print(f"Installing preset from [cyan]{from_url}[/cyan]...")
+            console.print(f"Installing preset from [cyan]{_escape_markup(from_url)}[/cyan]...")
             import urllib.error
             import tempfile
             import shutil
@@ -162,7 +158,7 @@ def preset_add(
                         redirect_validator=_validate_download_redirect,
                     ) as response:
                         final_url = response.geturl() if hasattr(response, "geturl") else from_url
-                        if not _is_allowed_download_url(_urlparse(final_url)):
+                        if not is_https_or_localhost_http(final_url):
                             console.print(
                                 "[red]Error:[/red] Preset URL redirected to a disallowed URL: "
                                 f"{final_url}. Redirect targets must use HTTPS with a hostname, "
@@ -175,7 +171,7 @@ def preset_add(
                             except TypeError:
                                 output.write(response.read())
                 except urllib.error.URLError as e:
-                    console.print(f"[red]Error:[/red] Failed to download: {e}")
+                    console.print(f"[red]Error:[/red] Failed to download: {_escape_markup(str(e))}")
                     raise typer.Exit(1)
 
                 manifest = manager.install_from_zip(zip_path, speckit_version, priority)
@@ -232,13 +228,13 @@ def preset_add(
             raise typer.Exit(1)
 
     except PresetCompatibilityError as e:
-        console.print(f"[red]Compatibility Error:[/red] {e}")
+        console.print(f"[red]Compatibility Error:[/red] {_escape_markup(str(e))}")
         raise typer.Exit(1)
     except PresetValidationError as e:
-        console.print(f"[red]Validation Error:[/red] {e}")
+        console.print(f"[red]Validation Error:[/red] {_escape_markup(str(e))}")
         raise typer.Exit(1)
     except PresetError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        console.print(f"[red]Error:[/red] {_escape_markup(str(e))}")
         raise typer.Exit(1)
 
 
@@ -280,7 +276,7 @@ def preset_search(
     try:
         results = catalog.search(query=query, tag=tag, author=author)
     except PresetError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        console.print(f"[red]Error:[/red] {_escape_markup(str(e))}")
         raise typer.Exit(1)
 
     if not results:
@@ -461,7 +457,14 @@ def preset_set_priority(
     raw_priority = metadata.get("priority")
     # Only skip if the stored value is already a valid int equal to requested priority
     # This ensures corrupted values (e.g., "high") get repaired even when setting to default (10)
-    if isinstance(raw_priority, int) and raw_priority == priority:
+    # A bool is an int in Python (isinstance(True, int) is True), so exclude it explicitly —
+    # mirroring normalize_priority's bool guard — otherwise a corrupted True/False priority
+    # equals 1/0 here and is never repaired.
+    if (
+        isinstance(raw_priority, int)
+        and not isinstance(raw_priority, bool)
+        and raw_priority == priority
+    ):
         console.print(f"[yellow]Preset '{preset_id}' already has priority {priority}[/yellow]")
         raise typer.Exit(0)
 
@@ -469,6 +472,9 @@ def preset_set_priority(
 
     # Update priority
     manager.registry.update(preset_id, {"priority": priority})
+    manager.reconcile_constitution(
+        f"Failed to reconcile constitution after changing priority for preset {preset_id}"
+    )
 
     console.print(f"[green]✓[/green] Preset '{preset_id}' priority changed: {old_priority} → {priority}")
     console.print("\n[dim]Lower priority = higher precedence in template resolution[/dim]")
@@ -502,6 +508,9 @@ def preset_enable(
 
     # Enable the preset
     manager.registry.update(preset_id, {"enabled": True})
+    manager.reconcile_constitution(
+        f"Failed to reconcile constitution after enabling preset {preset_id}"
+    )
 
     console.print(f"[green]✓[/green] Preset '{preset_id}' enabled")
     console.print("\nTemplates from this preset will now be included in resolution.")
@@ -536,6 +545,9 @@ def preset_disable(
 
     # Disable the preset
     manager.registry.update(preset_id, {"enabled": False})
+    manager.reconcile_constitution(
+        f"Failed to reconcile constitution after disabling preset {preset_id}"
+    )
 
     console.print(f"[green]✓[/green] Preset '{preset_id}' disabled")
     console.print("\nTemplates from this preset will be skipped during resolution.")
@@ -558,7 +570,7 @@ def preset_catalog_list():
     try:
         active_catalogs = catalog.get_active_catalogs()
     except PresetValidationError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        console.print(f"[red]Error:[/red] {_escape_markup(str(e))}")
         raise typer.Exit(1)
 
     console.print("\n[bold cyan]Active Preset Catalogs:[/bold cyan]\n")
@@ -623,7 +635,7 @@ def preset_catalog_add(
     try:
         tmp_catalog._validate_catalog_url(url)
     except PresetValidationError as e:
-        console.print(f"[red]Error:[/red] {e}")
+        console.print(f"[red]Error:[/red] {_escape_markup(str(e))}")
         raise typer.Exit(1)
 
     config_path = specify_dir / "preset-catalogs.yml"
@@ -634,7 +646,7 @@ def preset_catalog_add(
             config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
         except Exception as e:
             config_label = _display_project_path(project_root, config_path)
-            console.print(f"[red]Error:[/red] Failed to read {config_label}: {e}")
+            console.print(f"[red]Error:[/red] Failed to read {_escape_markup(str(config_label))}: {_escape_markup(str(e))}")
             raise typer.Exit(1)
     else:
         config = {}
