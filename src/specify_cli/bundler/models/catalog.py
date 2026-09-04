@@ -15,6 +15,12 @@ from .. import BundlerError
 from ..lib.yamlio import ensure_within, load_yaml
 
 CONFIG_FILENAME = "bundle-catalogs.yml"
+# Supported bundle-catalogs.yml schema (major version). Both readers of the
+# file — this module's _merge_config and commands_impl/catalog_config._read —
+# reject an unsupported major version so a file written by a newer/incompatible
+# Spec Kit fails fast instead of being parsed under the wrong assumptions.
+CONFIG_SCHEMA_VERSION = "1.0"
+CATALOG_SCHEMA_VERSION = "1.0"
 
 
 class InstallPolicy(str, Enum):
@@ -101,10 +107,11 @@ class CatalogSource:
 
 
 def _parse_tags(value: Any, entry_id: str) -> tuple[str, ...]:
-    """Coerce a catalog entry's ``tags`` into a tuple of strings.
+    """Parse a catalog entry's ``tags`` into a tuple of strings.
 
     Catalogs are untrusted input: a bare string would otherwise be iterated
-    character-by-character, so reject anything that is not a list/tuple.
+    character-by-character, so reject anything that is not a list/tuple, and
+    reject any non-string member instead of silently coercing it.
     """
     if value is None:
         return ()
@@ -112,7 +119,11 @@ def _parse_tags(value: Any, entry_id: str) -> tuple[str, ...]:
         raise BundlerError(
             f"Catalog entry '{entry_id}': 'tags' must be a list of strings."
         )
-    return tuple(str(t) for t in value)
+    if any(not isinstance(item, str) for item in value):
+        raise BundlerError(
+            f"Catalog entry '{entry_id}': 'tags' must be a list of strings."
+        )
+    return tuple(value)
 
 
 def _parse_verified(value: Any, entry_id: str) -> bool:
@@ -139,6 +150,7 @@ class CatalogEntry:
     license: str
     download_url: str
     requires_speckit_version: str
+    sha256: str | None = None
     provides: dict[str, int] = field(default_factory=dict)
     repository: str | None = None
     tags: tuple[str, ...] = ()
@@ -181,6 +193,11 @@ class CatalogEntry:
             license=str(data.get("license", "")).strip(),
             download_url=str(data.get("download_url", "")).strip(),
             requires_speckit_version=str(requires.get("speckit_version", "")).strip(),
+            sha256=(
+                None
+                if data.get("sha256") is None
+                else str(data["sha256"]).strip()
+            ),
             provides=dict(provides_raw),
             repository=(str(data["repository"]) if data.get("repository") else None),
             tags=_parse_tags(data.get("tags"), entry_id),
@@ -193,6 +210,7 @@ class CatalogEntry:
             description=self.description, author=self.author, license=self.license,
             download_url=self.download_url,
             requires_speckit_version=self.requires_speckit_version,
+            sha256=self.sha256,
             provides=self.provides, repository=self.repository, tags=self.tags,
             verified=self.verified, source_id=source.id,
             source_policy=source.install_policy,
@@ -203,6 +221,16 @@ def load_catalog_payload(data: Any) -> dict[str, CatalogEntry]:
     """Parse a catalog JSON payload into ``{bundle_id: CatalogEntry}``."""
     if not isinstance(data, dict):
         raise BundlerError("Catalog payload must be a JSON object.")
+    schema_version = data.get("schema_version")
+    if schema_version is not None and (
+        str(schema_version).strip().split(".")[0]
+        != CATALOG_SCHEMA_VERSION.split(".")[0]
+    ):
+        raise BundlerError(
+            f"Unsupported catalog schema version "
+            f"'{str(schema_version).strip()}'; this Spec Kit understands "
+            f"version {CATALOG_SCHEMA_VERSION}."
+        )
     bundles_raw = data.get("bundles")
     if not isinstance(bundles_raw, dict):
         raise BundlerError("Catalog payload is missing a 'bundles' object.")
@@ -266,6 +294,23 @@ def _merge_config(by_id: dict[str, CatalogSource], config_path: Path, scope: Sco
         raise BundlerError(
             f"Malformed catalog config at {config_path}: expected a mapping at "
             f"the top level, got {type(data).__name__}."
+        )
+    # Reject an unsupported major schema version, matching the sibling reader
+    # commands_impl/catalog_config._read. Without this, a file written by a
+    # newer/incompatible Spec Kit was silently parsed under v1 assumptions on
+    # the resolution path (bundle search/install), while the other reader
+    # rejected it — the two readers disagreed. An absent schema_version stays
+    # valid (backward compatible with configs that omit it).
+    schema_version = data.get("schema_version")
+    if schema_version is not None and (
+        str(schema_version).strip().split(".")[0]
+        != CONFIG_SCHEMA_VERSION.split(".")[0]
+    ):
+        raise BundlerError(
+            f"Unsupported catalog config schema version "
+            f"'{str(schema_version).strip()}' at {config_path}; this Spec Kit "
+            f"understands version {CONFIG_SCHEMA_VERSION}. The file may have been "
+            "written by a newer version or is corrupt."
         )
     catalogs = data.get("catalogs")
     if catalogs is None:

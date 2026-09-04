@@ -26,6 +26,45 @@ def test_missing_required_field_is_reported_by_name():
     assert any("bundle.license" in e for e in errors)
 
 
+@pytest.mark.parametrize(
+    "field", ["name", "role", "description", "author", "license"]
+)
+def test_explicit_null_bundle_field_is_reported_as_missing(field):
+    """A field present but null is how YAML spells an empty value (`author:`).
+
+    `str(None)` is the literal text "None", which is non-empty, so it passed the
+    required-field checks: the bundle validated clean and shipped "None" as its
+    author/license/description.
+    """
+    data = valid_manifest_dict()
+    data["bundle"][field] = None
+    manifest = BundleManifest.from_dict(data)
+    assert getattr(manifest.bundle, field) == ""
+    assert any(f"bundle.{field}" in e for e in manifest.structural_errors())
+
+
+def test_explicit_null_speckit_version_is_reported_as_missing():
+    data = valid_manifest_dict()
+    data["requires"]["speckit_version"] = None
+    manifest = BundleManifest.from_dict(data)
+    assert manifest.requires.speckit_version == ""
+    assert any("speckit_version" in e for e in manifest.structural_errors())
+
+
+def test_explicit_null_component_id_is_not_named_none():
+    """A null component id must not become a component literally named "None"."""
+    data = valid_manifest_dict()
+    for kind, items in (data.get("provides") or {}).items():
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            items[0]["id"] = None
+            break
+    else:  # pragma: no cover - fixture is expected to provide components
+        pytest.skip("fixture has no component list to null out")
+    manifest = BundleManifest.from_dict(data)
+    assert manifest.components, "fixture is expected to declare components"
+    assert all(ref.id != "None" for ref in manifest.components)
+
+
 def test_unsupported_schema_version_is_rejected():
     data = valid_manifest_dict(schema_version="9.9")
     errors = BundleManifest.from_dict(data).structural_errors()
@@ -123,6 +162,25 @@ def test_string_mcp_rejected_not_split_per_character():
     data = valid_manifest_dict()
     data["requires"]["mcp"] = "github"
     with pytest.raises(BundlerError, match="'requires.mcp' must be a list of strings"):
+        BundleManifest.from_dict(data)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tags", [1]),
+        ("requires.tools", [False]),
+        ("requires.mcp", [{}]),
+    ],
+)
+def test_string_list_fields_reject_non_string_members(field, value):
+    data = valid_manifest_dict()
+    if field == "tags":
+        data["tags"] = value
+    else:
+        data["requires"][field.split(".", 1)[1]] = value
+
+    with pytest.raises(BundlerError, match="must be a list of strings"):
         BundleManifest.from_dict(data)
 
 

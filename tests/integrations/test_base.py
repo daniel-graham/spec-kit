@@ -204,19 +204,69 @@ class TestBuildCommandInvocation:
     def test_skills_core_command(self):
         from specify_cli.integrations import get_integration
         i = get_integration("codex")
-        assert i.build_command_invocation("speckit.plan") == "/speckit-plan"
-        assert i.build_command_invocation("plan") == "/speckit-plan"
+        assert i.build_command_invocation("speckit.plan") == "$speckit-plan"
+        assert i.build_command_invocation("plan") == "$speckit-plan"
 
     def test_skills_extension_command(self):
         from specify_cli.integrations import get_integration
         i = get_integration("codex")
-        assert i.build_command_invocation("speckit.git.commit") == "/speckit-git-commit"
-        assert i.build_command_invocation("git.commit") == "/speckit-git-commit"
+        assert i.build_command_invocation("speckit.git.commit") == "$speckit-git-commit"
+        assert i.build_command_invocation("git.commit") == "$speckit-git-commit"
 
     def test_skills_extension_command_with_args(self):
         from specify_cli.integrations import get_integration
         i = get_integration("codex")
-        assert i.build_command_invocation("speckit.git.commit", "fix typo") == "/speckit-git-commit fix typo"
+        assert i.build_command_invocation("speckit.git.commit", "fix typo") == "$speckit-git-commit fix typo"
+
+    @pytest.mark.parametrize("integration_key", ["codex", "zcode"])
+    def test_dollar_skill_post_processing_is_idempotent(self, integration_key):
+        from specify_cli.integrations import get_integration
+
+        content = (
+            "---\nname: test\n---\n\n"
+            "Literal slash invocation: /speckit-plan\n"
+            "- For each executable hook, output the following based on its flag:\n"
+        )
+        integration = get_integration(integration_key)
+        once = integration.post_process_skill_content(content)
+        twice = integration.post_process_skill_content(once)
+
+        assert twice == once
+        assert once.count("replace dots (`.`) with hyphens") == 1
+        assert "$speckit-git-commit" in once
+        assert "/speckit-plan" in once
+
+    def test_kimi_skill_post_processing_is_idempotent(self):
+        """Kimi's post_process_skill_content must be idempotent.
+
+        The hook-command note is injected with the /skill: prefix by the base
+        class (via get_invocation_prefix), so the idempotency check matches on
+        re-runs without requiring the broad /speckit- -> /skill:speckit- body
+        replacement to recognise a duplicate.
+        """
+        from specify_cli.integrations import get_integration
+
+        content = (
+            "---\nname: test\n---\n\n"
+            "Literal slash invocation: /speckit-plan\n"
+            "- For each executable hook, output the following based on its flag:\n"
+        )
+        integration = get_integration("kimi")
+        once = integration.post_process_skill_content(content)
+        twice = integration.post_process_skill_content(once)
+
+        assert twice == once
+        assert once.count("replace dots (`.`) with hyphens") == 1
+        assert "/skill:speckit-git-commit" in once
+
+    def test_get_invocation_prefix_skill_colon(self):
+        """get_invocation_prefix returns '/skill:' for Kimi in skills mode."""
+        from specify_cli._invocation_style import get_invocation_prefix
+
+        assert get_invocation_prefix("kimi", True) == "/skill:"
+        assert get_invocation_prefix("kimi", False) == "/"
+        assert get_invocation_prefix("codex", True) == "$"
+        assert get_invocation_prefix("claude", True) == "/"
 
     def test_forge_core_command_hyphenated(self):
         """Forge installs hyphenated slash-commands (/speckit-<name>), so the
@@ -268,6 +318,26 @@ class TestResolveCommandRefs:
         result = IntegrationBase.resolve_command_refs(text, "-")
         assert result == "Run `/speckit-plan` to plan."
 
+    def test_dollar_prefix_core_command(self):
+        text = "Run `__SPECKIT_COMMAND_PLAN__` to plan."
+        result = IntegrationBase.resolve_command_refs(text, "-", "$")
+        assert result == "Run `$speckit-plan` to plan."
+
+    def test_skill_colon_prefix_core_command(self):
+        text = "Run `__SPECKIT_COMMAND_PLAN__` to plan."
+        result = IntegrationBase.resolve_command_refs(text, "-", "/skill:")
+        assert result == "Run `/skill:speckit-plan` to plan."
+
+    def test_process_template_kimi_uses_skill_colon_prefix(self):
+        """process_template must use /skill: prefix for Kimi without relying on
+        post_process_skill_content's broad replacement."""
+        text = "---\ndescription: test\n---\nRun `__SPECKIT_COMMAND_PLAN__` to plan."
+        result = IntegrationBase.process_template(
+            text, "kimi", "sh", invoke_separator="-"
+        )
+        assert "/skill:speckit-plan" in result
+        assert "/speckit-plan" not in result
+
     def test_multiple_placeholders(self):
         text = "__SPECKIT_COMMAND_SPECIFY__ then __SPECKIT_COMMAND_PLAN__ then __SPECKIT_COMMAND_TASKS__"
         result = IntegrationBase.resolve_command_refs(text, ".")
@@ -282,6 +352,16 @@ class TestResolveCommandRefs:
         text = "Run __SPECKIT_COMMAND_GIT_COMMIT__ to commit."
         result = IntegrationBase.resolve_command_refs(text, "-")
         assert result == "Run /speckit-git-commit to commit."
+
+    def test_hyphenated_command_dot(self):
+        text = "Run __SPECKIT_COMMAND_AGENT-CONTEXT_UPDATE__ to refresh."
+        result = IntegrationBase.resolve_command_refs(text, ".")
+        assert result == "Run /speckit.agent-context.update to refresh."
+
+    def test_hyphenated_command_hyphen(self):
+        text = "Run __SPECKIT_COMMAND_AGENT-CONTEXT_UPDATE__ to refresh."
+        result = IntegrationBase.resolve_command_refs(text, "-")
+        assert result == "Run /speckit-agent-context-update to refresh."
 
     def test_no_placeholders_unchanged(self):
         text = "No placeholders here."
@@ -328,6 +408,10 @@ class TestResolveCommandRefs:
 
     def test_lowercase_placeholder_not_matched(self):
         text = "Run __SPECKIT_COMMAND_plan__ to plan."
+        assert IntegrationBase.resolve_command_refs(text, ".") == text
+
+    def test_leading_hyphen_not_matched(self):
+        text = "Run __SPECKIT_COMMAND_-PLAN__ to plan."
         assert IntegrationBase.resolve_command_refs(text, ".") == text
 
     def test_placeholder_adjacent_to_text(self):

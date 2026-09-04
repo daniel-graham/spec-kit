@@ -56,6 +56,7 @@ body:
       description: Does this feature relate to a specific AI agent?
       options:
         - All agents
+        - Alquimia AI
         - Amp
         - Antigravity
         - Auggie CLI
@@ -63,9 +64,12 @@ body:
         - Cline
         - CodeBuddy
         - Codex CLI
+        - Command Code
         - Cursor
         - Devin for Terminal
+        - Docker Agent
         - Factory Droid
+        - DeepSeek Harness
         - Firebender
         - Forge
         - Gemini CLI
@@ -80,6 +84,7 @@ body:
         - Kiro CLI
         - Lingma
         - Mistral Vibe
+        - Muse Code
         - Oh My Pi
         - opencode
         - Pi Coding Agent

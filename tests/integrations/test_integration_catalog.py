@@ -116,12 +116,15 @@ class TestCatalogURLValidation:
         [
             "https://[::1",                 # unclosed ipv6 bracket
             "https://[not-an-ip]/c.json",   # bracketed non-ip host
+            "https://example.com:notaport/c.json",  # non-numeric port
+            "https://example.com:65536/c.json",     # out-of-range port
         ],
     )
     def test_malformed_url_rejected_cleanly(self, url):
-        # A malformed authority makes urlparse/hostname raise ValueError. The
-        # validator must turn that into its normal catalog error, not leak a
-        # raw ValueError to the caller.
+        # A malformed authority makes urlparse/hostname raise ValueError, and a
+        # bad port makes ``parsed.port`` raise it. The validator must turn that
+        # into its normal catalog error, not leak a raw ValueError to the caller
+        # (or, for a bad port, accept the URL and fail later at fetch time).
         with pytest.raises(IntegrationCatalogError, match="malformed"):
             IntegrationCatalog._validate_catalog_url(url)
 
@@ -230,9 +233,16 @@ class TestCatalogFetch:
             def __init__(self, data, url=""):
                 self._data = json.dumps(data).encode()
                 self._url = url if isinstance(url, str) else url.full_url
+                self._offset = 0
 
-            def read(self):
-                return self._data
+            def read(self, size=-1):
+                if size == -1:
+                    chunk = self._data[self._offset:]
+                    self._offset = len(self._data)
+                else:
+                    chunk = self._data[self._offset:self._offset + size]
+                    self._offset += len(chunk)
+                return chunk
 
             def geturl(self):
                 return self._url
@@ -319,6 +329,187 @@ class TestCatalogFetch:
         # The poisoned cache is dropped and the (valid) source is refetched.
         results = cat.search()
         assert "acme-coder" in [r["id"] for r in results]
+
+    def test_fetch_rejects_oversized_catalog_response(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression: _fetch_single_catalog must use read_response_limited
+        with MAX_JSON_METADATA_BYTES, not unbounded resp.read()."""
+        from specify_cli.integrations.catalog import (
+            IntegrationCatalog,
+            IntegrationCatalogError,
+        )
+        import specify_cli.integrations.catalog as catalog_module
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.delenv("SPECKIT_INTEGRATION_CATALOG_URL", raising=False)
+        (tmp_path / ".specify").mkdir()
+        cat = IntegrationCatalog(tmp_path)
+
+        # Set limit very small so any response is oversized
+        monkeypatch.setattr(catalog_module, "MAX_JSON_METADATA_BYTES", 32)
+
+        class _OversizedResponse:
+            def __init__(self):
+                self._data = b"x" * 64
+                self._offset = 0
+
+            def read(self, size=-1):
+                if size == -1:
+                    chunk = self._data[self._offset:]
+                    self._offset = len(self._data)
+                else:
+                    chunk = self._data[self._offset:self._offset + size]
+                    self._offset += len(chunk)
+                return chunk
+
+            def geturl(self):
+                return "https://example.com/catalog.json"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        import specify_cli.authentication.http as _auth_http
+
+        def fake_urlopen(req, timeout=10):
+            return _OversizedResponse()
+
+        monkeypatch.setattr(_auth_http.urllib.request, "urlopen", fake_urlopen)
+
+        from specify_cli.integrations.catalog import IntegrationCatalogEntry
+
+        entry = IntegrationCatalogEntry(
+            url="https://example.com/catalog.json",
+            name="test",
+            priority=1,
+            install_allowed=True,
+        )
+
+        with pytest.raises(IntegrationCatalogError, match="exceeds maximum size"):
+            cat._fetch_single_catalog(entry, force_refresh=True)
+
+    def _patch_urlopen_bytes(self, monkeypatch, bodies):
+        """Patch urlopen to serve raw *bodies* keyed by URL substring.
+
+        Mirrors ``_patch_urlopen`` but passes the bytes through verbatim: these
+        tests need a body that is not valid UTF-8, which ``json.dumps`` cannot
+        produce.
+        """
+
+        class _RawResponse:
+            def __init__(self, data, url):
+                self._data = data
+                self._url = url
+                self._offset = 0
+
+            def read(self, size=-1):
+                if size == -1:
+                    chunk = self._data[self._offset:]
+                    self._offset = len(self._data)
+                else:
+                    chunk = self._data[self._offset:self._offset + size]
+                    self._offset += len(chunk)
+                return chunk
+
+            def geturl(self):
+                return self._url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
+
+        def fake_urlopen(req, timeout=10):
+            url = req if isinstance(req, str) else req.full_url
+            for marker, body in bodies.items():
+                if marker in url:
+                    return _RawResponse(body, url)
+            raise AssertionError(f"unexpected URL requested: {url}")
+
+        import specify_cli.authentication.http as _auth_http
+        monkeypatch.setattr(_auth_http.urllib.request, "urlopen", fake_urlopen)
+
+    def test_fetch_wraps_non_utf8_catalog_response(self, tmp_path, monkeypatch):
+        """Regression: a non-UTF-8 response body must raise IntegrationCatalogError.
+
+        ``.decode("utf-8")`` runs before ``json.loads``, so the resulting
+        UnicodeDecodeError is not a JSONDecodeError and slipped past both
+        handlers as a raw traceback.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.delenv("SPECKIT_INTEGRATION_CATALOG_URL", raising=False)
+        (tmp_path / ".specify").mkdir(exist_ok=True)
+        cat = IntegrationCatalog(tmp_path)
+
+        self._patch_urlopen_bytes(
+            monkeypatch,
+            {"catalog.json": b'{"schema_version": "1.0", "name": "\xff\xfe"}'},
+        )
+
+        entry = IntegrationCatalogEntry(
+            url="https://example.com/catalog.json",
+            name="test",
+            priority=1,
+            install_allowed=True,
+        )
+
+        with pytest.raises(IntegrationCatalogError, match="not valid UTF-8"):
+            cat._fetch_single_catalog(entry, force_refresh=True)
+
+    def test_search_skips_non_utf8_catalog(self, tmp_path, monkeypatch, capsys):
+        """A single non-UTF-8 catalog must not take down the whole search.
+
+        ``_get_merged_integrations`` is built to warn and continue on a bad
+        catalog; an unwrapped UnicodeDecodeError defeated that entirely.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.delenv("SPECKIT_INTEGRATION_CATALOG_URL", raising=False)
+        specify = tmp_path / ".specify"
+        specify.mkdir(exist_ok=True)
+        (specify / "integration-catalogs.yml").write_text(
+            "catalogs:\n"
+            "  - name: broken\n"
+            "    url: https://example.com/broken.json\n"
+            "    priority: 1\n"
+            "  - name: healthy\n"
+            "    url: https://example.com/healthy.json\n"
+            "    priority: 2\n",
+            encoding="utf-8",
+        )
+
+        healthy = json.dumps(
+            {
+                "schema_version": "1.0",
+                "integrations": {
+                    "acme-coder": {
+                        "name": "Acme Coder",
+                        "version": "1.0.0",
+                        "description": "Acme integration",
+                    }
+                },
+            }
+        ).encode("utf-8")
+
+        self._patch_urlopen_bytes(
+            monkeypatch,
+            {
+                "broken.json": b'{"schema_version": "1.0", "name": "\xff\xfe"}',
+                "healthy.json": healthy,
+            },
+        )
+
+        cat = IntegrationCatalog(tmp_path)
+        results = cat.search()
+
+        assert "acme-coder" in [r["id"] for r in results]
+        assert "broken" in capsys.readouterr().err
 
     def test_search_by_tag(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HOME", str(tmp_path))
@@ -509,6 +700,36 @@ class TestIntegrationDescriptor:
         with pytest.raises(IntegrationDescriptorError, match="expected a list"):
             IntegrationDescriptor(p)
 
+    @pytest.mark.parametrize(
+        "content", ["[]", "false", "0", "''", "null", "~", "NULL", "- a", "hello"]
+    )
+    def test_falsy_non_mapping_descriptor_reports_shape_error(self, tmp_path, content):
+        """Every non-mapping document reports the mapping-shape error.
+
+        `_validate` opens with an `isinstance(self.data, dict)` check, so a
+        truthy non-mapping (`- a`, `hello`) correctly reported "Descriptor root
+        must be a YAML mapping". `_load`'s plain `yaml.safe_load(fh) or {}`
+        masked that for the falsy shapes `[]`, `false`, `0`, `''` (coerced to
+        an empty mapping) and for an explicit null scalar (`null`, `~`, `NULL`
+        -- indistinguishable from an empty document by `safe_load` alone), so
+        those five reported "Missing required field: schema_version" instead.
+        """
+        p = tmp_path / "integration.yml"
+        p.write_text(content)
+        with pytest.raises(
+            IntegrationDescriptorError,
+            match="Descriptor root must be a YAML mapping",
+        ):
+            IntegrationDescriptor(p)
+
+    @pytest.mark.parametrize("content", ["", "---"])
+    def test_empty_document_still_reports_missing_fields(self, tmp_path, content):
+        """Empty documents are normalized to an empty mapping, so missing fields are reported."""
+        p = tmp_path / "integration.yml"
+        p.write_text(content)
+        with pytest.raises(IntegrationDescriptorError, match="Missing required field: schema_version"):
+            IntegrationDescriptor(p)
+
     def test_file_not_found(self, tmp_path):
         with pytest.raises(IntegrationDescriptorError, match="Descriptor not found"):
             IntegrationDescriptor(tmp_path / "nonexistent.yml")
@@ -524,6 +745,10 @@ class TestIntegrationDescriptor:
         desc = IntegrationDescriptor(p)
         h = desc.get_hash()
         assert h.startswith("sha256:")
+        import hashlib
+        content = p.read_bytes()
+        expected = f"sha256:{hashlib.sha256(content).hexdigest()}"
+        assert h == expected
 
     def test_tools_accessor(self, tmp_path):
         data = {**VALID_DESCRIPTOR, "requires": {
@@ -592,12 +817,23 @@ class TestIntegrationListCatalog:
             def __init__(self, data, url=""):
                 self._data = json.dumps(data).encode()
                 self._url = url if isinstance(url, str) else url.full_url
-            def read(self):
-                return self._data
+                self._offset = 0
+
+            def read(self, size=-1):
+                if size == -1:
+                    chunk = self._data[self._offset:]
+                    self._offset = len(self._data)
+                else:
+                    chunk = self._data[self._offset:self._offset + size]
+                    self._offset += len(chunk)
+                return chunk
+
             def geturl(self):
                 return self._url
+
             def __enter__(self):
                 return self
+
             def __exit__(self, *a):
                 pass
 
@@ -632,6 +868,40 @@ class TestIntegrationListCatalog:
         assert result.exit_code == 0
         assert "copilot" in result.output
         assert "installed" in result.output
+
+    def test_catalog_list_escapes_rich_markup(self, tmp_path, monkeypatch):
+        """User-editable catalog name/url/description must not be parsed as Rich markup."""
+        from typer.testing import CliRunner
+        from specify_cli import app
+        from specify_cli.integrations.catalog import IntegrationCatalog
+        runner = CliRunner()
+        project = self._init_project(tmp_path)
+
+        configs = [
+            {
+                "name": "Bracket [Catalog]",
+                "url": "https://example.com/[cat].json",
+                "description": "desc [with] brackets",
+                "install_allowed": True,
+            },
+        ]
+        monkeypatch.setattr(
+            IntegrationCatalog,
+            "get_project_catalog_configs",
+            lambda self: [dict(c) for c in configs],
+        )
+
+        old = os.getcwd()
+        try:
+            os.chdir(project)
+            result = runner.invoke(app, ["integration", "catalog", "list"])
+        finally:
+            os.chdir(old)
+
+        assert result.exit_code == 0, result.output
+        assert "Bracket [Catalog]" in result.output
+        assert "https://example.com/[cat].json" in result.output
+        assert "desc [with] brackets" in result.output
 
 
 # ---------------------------------------------------------------------------

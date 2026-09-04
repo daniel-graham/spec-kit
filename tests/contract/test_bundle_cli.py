@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 
 from specify_cli import app
 from specify_cli.bundler.services.packager import build_bundle
+from tests.conftest import strip_ansi
 from tests.bundler_helpers import (
     catalog_entry_dict,
     valid_manifest_dict,
@@ -24,6 +25,42 @@ from tests.bundler_helpers import (
 )
 
 runner = CliRunner()
+
+MARKUP_BUNDLE_ID = "[red]markup-id[/red]"
+MARKUP_SOURCE_ID = "[underline]markup-source[/underline]"
+
+
+def _configure_markup_catalog(project: Path, **overrides: object) -> dict:
+    entry = catalog_entry_dict(
+        MARKUP_BUNDLE_ID,
+        name="[green]Markup Name[/green]",
+        version="[blue]1.0.0[/blue]",
+        role="[magenta]Markup Role[/magenta]",
+        description="[yellow]Markup Description[/yellow]",
+        author="[cyan]Markup Author[/cyan]",
+        license="[bold]Markup License[/bold]",
+        download_url="https://example.com/markup-bundle.zip",
+        requires={"speckit_version": "[italic]>=0.1.0[/italic]"},
+        **overrides,
+    )
+    catalog = project / "markup-catalog.json"
+    write_catalog_file(catalog, {MARKUP_BUNDLE_ID: entry})
+    config = {
+        "schema_version": "1.0",
+        "catalogs": [
+            {
+                "id": MARKUP_SOURCE_ID,
+                "url": str(catalog),
+                "priority": 1,
+                "install_policy": "install-allowed",
+            }
+        ],
+    }
+    (project / ".specify" / "bundle-catalogs.yml").write_text(
+        yaml.safe_dump(config),
+        encoding="utf-8",
+    )
+    return entry
 
 
 @pytest.fixture()
@@ -124,6 +161,24 @@ def test_search_works_without_a_project(tmp_path: Path, monkeypatch):
     assert result.output.strip().startswith("[")
 
 
+def test_search_escapes_catalog_markup(project: Path):
+    entry = _configure_markup_catalog(project)
+
+    result = runner.invoke(app, ["bundle", "search", "--offline"])
+
+    assert result.exit_code == 0, result.output
+    output = " ".join(strip_ansi(result.output).split())
+    for value in (
+        entry["id"],
+        entry["name"],
+        entry["version"],
+        entry["role"],
+        entry["description"],
+        MARKUP_SOURCE_ID,
+    ):
+        assert value in output
+
+
 def test_info_unknown_bundle_without_project_reports_not_found(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)  # no .specify/
     result = runner.invoke(app, ["bundle", "info", "does-not-exist", "--offline"])
@@ -162,6 +217,31 @@ def test_catalog_remove_builtin_is_refused(project: Path):
     assert "built-in" in result.output
 
 
+# Every ``bundle`` error path funnels through ``_fail(str(exc))``, and the
+# BundlerError messages interpolate untrusted data -- including the command's
+# own argument. An unbalanced closer used to raise MarkupError instead of the
+# error, leaving the user with a traceback and no message at all.
+@pytest.mark.parametrize(
+    "argv, expected",
+    [
+        (
+            ["bundle", "catalog", "add", "ssh://ex[/red]ample.com/c.json"],
+            "ssh://ex[/red]ample.com/c.json",
+        ),
+        (["bundle", "catalog", "remove", "no[/red]such"], "no[/red]such"),
+        (["bundle", "update", "no[/red]such"], "no[/red]such"),
+        (["bundle", "remove", "no[/red]such"], "no[/red]such"),
+    ],
+)
+def test_error_paths_escape_rich_markup(project: Path, argv: list, expected: str):
+    result = runner.invoke(app, argv)
+
+    assert result.exit_code == 1
+    # A MarkupError would surface here as an exception rather than a clean exit.
+    assert isinstance(result.exception, SystemExit)
+    assert expected in strip_ansi(result.output)
+
+
 def test_validate_reports_invalid_manifest(project: Path):
     data = valid_manifest_dict()
     del data["bundle"]["license"]
@@ -180,6 +260,33 @@ def test_validate_accepts_valid_manifest(project: Path):
     result = runner.invoke(app, ["bundle", "validate", "--offline"])
     assert result.exit_code == 0, result.output
     assert "valid" in result.output
+
+
+def test_validate_escapes_manifest_markup_in_errors(project: Path):
+    data = valid_manifest_dict()
+    # An invalid constraint is echoed back inside the validation error.
+    data["requires"] = {"speckit_version": ">=1.0[/bold]"}
+    (project / "bundle.yml").write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    result = runner.invoke(app, ["bundle", "validate", "--offline"])
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert ">=1.0[/bold]" in strip_ansi(result.output)
+
+
+def test_validate_escapes_manifest_markup_in_warnings(project: Path):
+    data = valid_manifest_dict()
+    # Step ids are not charset-validated, and the unresolved-reference warning
+    # echoes them -- so an otherwise *valid* manifest crashed just as readily as
+    # an invalid one, on the success path.
+    data["provides"]["steps"] = [{"id": "step[/bold]a"}]
+    (project / "bundle.yml").write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    result = runner.invoke(app, ["bundle", "validate", "--offline"])
+
+    assert result.exit_code == 0, repr(result.exception)
+    assert "step[/bold]a" in strip_ansi(result.output)
 
 
 def test_validate_rejects_broken_reference(project: Path):
@@ -210,6 +317,68 @@ def test_build_produces_artifact(project: Path):
     assert result.exit_code == 0, result.output
     artifacts = list((project / "dist").glob("*.zip"))
     assert len(artifacts) == 1
+
+
+def test_build_escapes_markup_in_output_path(project: Path):
+    """The build success line echoes a caller-supplied ``--output`` path.
+
+    Brackets are legal in a directory name on both POSIX and Windows, so the
+    artifact is built and *then* misreported: ``[bold]`` is consumed as a style
+    tag, and the success line names a path that does not exist on disk.
+
+    A closing tag (``[/red]``) would raise MarkupError outright, but ``/`` is a
+    path separator on Windows, so this uses the silent-swallow form to keep the
+    fixture portable.
+    """
+    (project / "bundle.yml").write_text(
+        yaml.safe_dump(valid_manifest_dict()), encoding="utf-8"
+    )
+    (project / "README.md").write_text("# Demo", encoding="utf-8")
+    out_dir = project / "dist[bold]out"
+
+    result = runner.invoke(app, ["bundle", "build", "--output", str(out_dir)])
+
+    assert result.exit_code == 0, repr(result.exception)
+    assert list(out_dir.glob("*.zip")), "the artifact should still be built"
+    # Join across Rich's wrap points: the success line prints an absolute path,
+    # so the console folds it mid-token whenever the temp directory is long
+    # enough, which is a property of the runner's path, not of the escaping.
+    assert "dist[bold]out" in "".join(strip_ansi(result.output).split()), (
+        "the reported path must match the directory actually written"
+    )
+
+
+def test_list_escapes_markup_in_records(project: Path):
+    """``bundle list`` renders record fields that are never charset-validated.
+
+    ``InstalledBundleRecord.from_dict`` accepts any non-empty string for
+    ``bundle_id``/``version`` and any string for ``installed_at``, so a records
+    file that *loads cleanly* could still crash the command that displays it.
+    """
+    (project / ".specify" / "bundle-records.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "bundles": [
+                    {
+                        "bundle_id": "demo[/red]id",
+                        "version": "1.0.0[/bold]",
+                        "installed_at": "2026-01-01T00:00:00Z[/dim]",
+                        "contributed_components": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["bundle", "list"])
+
+    assert result.exit_code == 0, repr(result.exception)
+    output = strip_ansi(result.output)
+    assert "demo[/red]id" in output
+    assert "1.0.0[/bold]" in output
+    assert "2026-01-01T00:00:00Z[/dim]" in output
 
 
 def _mock_manifest_download(monkeypatch, source_path: Path) -> None:
@@ -259,6 +428,83 @@ def test_info_expands_full_component_set(project: Path, monkeypatch):
     text = runner.invoke(app, ["bundle", "info", "demo-bundle", "--offline"])
     assert "preset-a v2.0.0" in text.output
     assert "Trust" in text.output
+
+
+def test_info_escapes_catalog_markup(project: Path, monkeypatch):
+    entry = _configure_markup_catalog(project)
+    bundle_dir = project / "markup-bundle"
+    bundle_dir.mkdir()
+    manifest_data = valid_manifest_dict()
+    manifest_data["bundle"]["id"] = MARKUP_BUNDLE_ID
+    manifest_data["integration"] = {
+        "id": "[conceal]markup-integration[/conceal]"
+    }
+    manifest_path = bundle_dir / "bundle.yml"
+    manifest_path.write_text(yaml.safe_dump(manifest_data), encoding="utf-8")
+    _mock_manifest_download(monkeypatch, manifest_path)
+    monkeypatch.setattr(
+        "specify_cli.commands.bundle._manifest_component_view",
+        lambda manifest: [
+            {
+                "kind": "extensions",
+                "id": "[reverse]markup-component[/reverse]",
+                "version": "[strike]2.0.0[/strike]",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "specify_cli.commands.bundle._bundle_overlaps",
+        lambda project_root, manifest, *, offline: [
+            "[blink]markup-overlap[/blink]"
+        ],
+    )
+
+    result = runner.invoke(
+        app,
+        ["bundle", "info", MARKUP_BUNDLE_ID, "--offline"],
+    )
+
+    assert result.exit_code == 0, result.output
+    output = " ".join(strip_ansi(result.output).split())
+    for value in (
+        entry["id"],
+        entry["name"],
+        entry["version"],
+        entry["role"],
+        entry["description"],
+        entry["author"],
+        entry["license"],
+        entry["requires"]["speckit_version"],
+        MARKUP_SOURCE_ID,
+        "[conceal]markup-integration[/conceal]",
+        "[reverse]markup-component[/reverse]",
+        "[strike]2.0.0[/strike]",
+        "[blink]markup-overlap[/blink]",
+    ):
+        assert value in output
+
+
+def test_info_escapes_catalog_provides_fallback_markup(project: Path, monkeypatch):
+    markup_count = "[bold]markup-count[/bold]"
+    _configure_markup_catalog(
+        project,
+        provides={"extensions": markup_count},
+    )
+    bundle_dir = project / "markup-bundle"
+    bundle_dir.mkdir()
+    manifest_data = valid_manifest_dict(provides={})
+    manifest_data["bundle"]["id"] = MARKUP_BUNDLE_ID
+    manifest_path = bundle_dir / "bundle.yml"
+    manifest_path.write_text(yaml.safe_dump(manifest_data), encoding="utf-8")
+    _mock_manifest_download(monkeypatch, manifest_path)
+
+    result = runner.invoke(
+        app,
+        ["bundle", "info", MARKUP_BUNDLE_ID, "--offline"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert markup_count in strip_ansi(result.output)
 
 
 def test_info_expands_discovery_only_bundle(project: Path, monkeypatch):
@@ -543,6 +789,38 @@ def test_bundle_info_resolves_github_browser_release_url(project: Path):
     assert asset_calls[0][1] == {"Accept": "application/octet-stream"}
 
 
+def test_bundle_info_rejects_utf16_remote_manifest_like_local_sources(project: Path):
+    """A downloaded (non-zip) bundle.yml must be decoded strictly as UTF-8.
+
+    ``yamlio.load_yaml`` decodes local ``bundle.yml`` sources strictly as
+    UTF-8, so a well-formed UTF-16 manifest (a realistic PowerShell
+    ``Out-File`` output) is rejected. Feeding the downloaded bytes straight
+    to ``yaml.safe_load(io.BytesIO(raw))`` let PyYAML's Reader honour the
+    UTF-16 BOM and silently *accept* the same manifest instead, diverging
+    from local/zip sources (the zip branch of this same download path was
+    already fixed for the identical bug).
+    """
+    api_asset_url = "https://api.github.com/repos/org/repo/releases/assets/99"
+    manifest_yaml_utf16 = yaml.safe_dump(valid_manifest_dict()).encode("utf-16")
+
+    def fake_open_url(url, timeout=None, extra_headers=None, redirect_validator=None):
+        return FakeBundleResponse(manifest_yaml_utf16, url=api_asset_url)
+
+    catalog = project / "catalog.json"
+    write_catalog_file(
+        catalog,
+        {"demo-bundle": catalog_entry_dict("demo-bundle", download_url=api_asset_url)},
+    )
+    _make_catalog_config(catalog, project)
+
+    with patch("specify_cli.authentication.http.open_url", side_effect=fake_open_url):
+        result = runner.invoke(app, ["bundle", "info", "demo-bundle", "--json"])
+
+    assert result.exit_code == 1
+    output_flat = " ".join(result.output.split())
+    assert "could not be read" in output_flat.lower()
+
+
 def test_bundle_info_passes_through_api_asset_url(project: Path):
     """bundle info passes a direct GitHub API asset URL through with octet-stream."""
     api_asset_url = "https://api.github.com/repos/org/repo/releases/assets/77"
@@ -767,3 +1045,33 @@ def test_bundle_info_resolves_ghes_browser_release_url(project: Path):
 
     payload = json.loads(result.output)
     assert payload["id"] == "demo-bundle"
+
+
+def test_bundle_download_rejects_oversized_response(project: Path, monkeypatch):
+    """Bundle download rejects responses exceeding MAX_DOWNLOAD_BYTES."""
+    # Monkeypatch to a small limit so the test is fast and low-memory.
+    monkeypatch.setattr(
+        "specify_cli.commands.bundle.MAX_DOWNLOAD_BYTES", 100
+    )
+
+    api_asset_url = "https://api.github.com/repos/org/repo/releases/assets/99"
+
+    def fake_open_url(url, timeout=None, extra_headers=None, redirect_validator=None):
+        # Return a response that exceeds 100 bytes.
+        return FakeBundleResponse(b"x" * 200, url=api_asset_url)
+
+    catalog = project / "catalog.json"
+    write_catalog_file(
+        catalog,
+        {"demo-bundle": catalog_entry_dict("demo-bundle", download_url=api_asset_url)},
+    )
+    _make_catalog_config(catalog, project)
+
+    with patch("specify_cli.authentication.http.open_url", side_effect=fake_open_url):
+        result = runner.invoke(app, ["bundle", "info", "demo-bundle", "--json"])
+
+    # Must fail with a size-limit error, not an unhandled traceback.
+    assert result.exit_code == 1
+    # Rich may wrap the message across lines; normalise whitespace before checking.
+    output_flat = " ".join(result.output.split())
+    assert "exceeds maximum size of 100 bytes" in output_flat

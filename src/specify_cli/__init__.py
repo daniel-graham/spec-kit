@@ -77,7 +77,9 @@ from ._version import (
 from ._agent_config import (
     AGENT_CONFIG as AGENT_CONFIG,
     DEFAULT_INIT_INTEGRATION as DEFAULT_INIT_INTEGRATION,
+    DEFAULT_INIT_INTEGRATION_ENV_VAR as DEFAULT_INIT_INTEGRATION_ENV_VAR,
     SCRIPT_TYPE_CHOICES as SCRIPT_TYPE_CHOICES,
+    resolve_default_init_integration as resolve_default_init_integration,
 )
 from ._init_options import (
     INIT_OPTIONS_FILE as INIT_OPTIONS_FILE,
@@ -114,6 +116,7 @@ def _refresh_shared_templates(
     project_path: Path,
     *,
     invoke_separator: str,
+    invoke_prefix: str = "/",
     force: bool = False,
 ) -> None:
     """Refresh default-sensitive shared templates without touching scripts."""
@@ -124,6 +127,7 @@ def _refresh_shared_templates(
         repo_root=_repo_root(),
         console=console,
         invoke_separator=invoke_separator,
+        invoke_prefix=invoke_prefix,
         force=force,
     )
 
@@ -134,6 +138,7 @@ def _install_shared_infra(
     tracker: StepTracker | None = None,
     force: bool = False,
     invoke_separator: str = ".",
+    invoke_prefix: str = "/",
     refresh_managed: bool = False,
     refresh_hint: str | None = None,
 ) -> bool:
@@ -177,6 +182,7 @@ def _install_shared_infra(
         console=console,
         force=force,
         invoke_separator=invoke_separator,
+        invoke_prefix=invoke_prefix,
         refresh_managed=refresh_managed,
         refresh_hint=refresh_hint,
     )
@@ -188,6 +194,7 @@ def _install_shared_infra_or_exit(
     tracker: StepTracker | None = None,
     force: bool = False,
     invoke_separator: str = ".",
+    invoke_prefix: str = "/",
     refresh_managed: bool = False,
     refresh_hint: str | None = None,
 ) -> bool:
@@ -198,6 +205,7 @@ def _install_shared_infra_or_exit(
             tracker=tracker,
             force=force,
             invoke_separator=invoke_separator,
+            invoke_prefix=invoke_prefix,
             refresh_managed=refresh_managed,
             refresh_hint=refresh_hint,
         )
@@ -507,6 +515,11 @@ _register_extension_cmds(app)
 # Moved to integrations/_commands.py — registered here to preserve CLI surface.
 from .integrations._commands import register as _register_integration_cmds  # noqa: E402
 _register_integration_cmds(app)
+
+
+# ===== Event Commands =====
+from .commands.event import register as _register_event_cmds  # noqa: E402
+_register_event_cmds(app)
 
 # Re-export selected helpers to preserve the public import surface.
 from .integrations._helpers import (  # noqa: E402

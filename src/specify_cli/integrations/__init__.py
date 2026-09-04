@@ -48,6 +48,7 @@ def _register_builtins() -> None:
     """
     # -- Imports (alphabetical) -------------------------------------------
     from .agy import AgyIntegration
+    from .alquimia import AlquimiaAIIntegration
     from .amp import AmpIntegration
     from .auggie import AuggieIntegration
     from .bob import BobIntegration
@@ -55,10 +56,13 @@ def _register_builtins() -> None:
     from .cline import ClineIntegration
     from .codebuddy import CodebuddyIntegration
     from .codex import CodexIntegration
+    from .command_code import CommandCodeIntegration
     from .copilot import CopilotIntegration
     from .cursor_agent import CursorAgentIntegration
     from .devin import DevinIntegration
+    from .docker_agent import DockerAgentIntegration
     from .droid import DroidIntegration
+    from .dsh import DshIntegration
     from .firebender import FirebenderIntegration
     from .forge import ForgeIntegration
     from .gemini import GeminiIntegration
@@ -71,6 +75,7 @@ def _register_builtins() -> None:
     from .kimi import KimiIntegration
     from .kiro_cli import KiroCliIntegration
     from .lingma import LingmaIntegration
+    from .muse import MuseIntegration
     from .omp import OmpIntegration
     from .opencode import OpencodeIntegration
     from .pi import PiIntegration
@@ -86,6 +91,7 @@ def _register_builtins() -> None:
 
     # -- Registration (alphabetical) --------------------------------------
     _register(AgyIntegration())
+    _register(AlquimiaAIIntegration())
     _register(AmpIntegration())
     _register(AuggieIntegration())
     _register(BobIntegration())
@@ -93,10 +99,13 @@ def _register_builtins() -> None:
     _register(ClineIntegration())
     _register(CodebuddyIntegration())
     _register(CodexIntegration())
+    _register(CommandCodeIntegration())
     _register(CopilotIntegration())
     _register(CursorAgentIntegration())
     _register(DevinIntegration())
+    _register(DockerAgentIntegration())
     _register(DroidIntegration())
+    _register(DshIntegration())
     _register(FirebenderIntegration())
     _register(ForgeIntegration())
     _register(GeminiIntegration())
@@ -109,6 +118,7 @@ def _register_builtins() -> None:
     _register(KimiIntegration())
     _register(KiroCliIntegration())
     _register(LingmaIntegration())
+    _register(MuseIntegration())
     _register(OmpIntegration())
     _register(OpencodeIntegration())
     _register(PiIntegration())

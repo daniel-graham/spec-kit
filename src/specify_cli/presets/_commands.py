@@ -9,6 +9,7 @@ keeps working.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 import typer
@@ -17,8 +18,12 @@ from rich.markup import escape as _escape_markup
 
 from .._console import console
 from .._download_security import (
+    archive_format_from_name,
+    archive_suffix,
+    detect_archive_format,
     is_https_or_localhost_http,
     is_safe_download_redirect,
+    read_response_limited,
 )
 
 preset_app = typer.Typer(
@@ -33,6 +38,112 @@ preset_catalog_app = typer.Typer(
     add_completion=False,
 )
 preset_app.add_typer(preset_catalog_app, name="catalog")
+
+
+def _warn_unmet_extension_dependencies(manager, manifest) -> None:
+    """Warn when a preset's declared extension dependencies are unsatisfied.
+
+    A preset whose command overrides call into an extension is inert without
+    it, but the overrides still fall through to the core workflow, so nothing
+    breaks -- it just silently does less than the user expects. Naming the
+    missing extension and the command that installs it turns that silence into
+    something actionable. See issue #4231.
+    """
+    from ..extensions._commands import _command_safe_id
+
+    unmet = manager.find_unmet_extension_dependencies(manifest)
+    if not unmet:
+        return
+
+    console.print()
+    console.print("[yellow]![/yellow]  This preset depends on extensions that are not satisfied:")
+    needs_catalog = False
+    for dep in unmet:
+        uses_catalog = False
+        extension_id = _escape_markup(dep["id"])
+        # The displayed id only needs Rich escaping, but a suggested command
+        # has to survive Typer's parser: `^[a-z0-9-]+$` admits a leading
+        # hyphen, so an id like `--force` would render as an option rather
+        # than the positional argument. _command_safe_id substitutes a
+        # placeholder in that case, the same way extension commands do.
+        command_id = _command_safe_id(dep["id"])
+        reason = dep["reason"]
+        # The remediation has to match the reason. `extension add` refuses an
+        # already-installed extension without --force, and `extension update`
+        # only moves forward to the catalog release. A general PEP 440
+        # constraint may require an exact version, an upper bound, or a
+        # downgrade, so do not promise that update will satisfy it.
+        if reason == "missing":
+            console.print(f"    [yellow]{extension_id}[/yellow] is not installed")
+            label, remedy = "Install with", f"specify extension add {command_id}"
+            uses_catalog = True
+        elif reason == "corrupt":
+            console.print(
+                f"    [yellow]{extension_id}[/yellow] has an unreadable "
+                "registry entry"
+            )
+            # is_installed() still counts the key, so a plain add is refused.
+            label = "Reinstall with"
+            remedy = f"specify extension add {command_id} --force"
+            uses_catalog = True
+        elif reason == "stale":
+            console.print(
+                f"    [yellow]{extension_id}[/yellow] is registered but its "
+                "files are missing"
+            )
+            label = "Reinstall with"
+            remedy = f"specify extension add {command_id} --force"
+            uses_catalog = True
+        elif reason == "disabled":
+            console.print(f"    [yellow]{extension_id}[/yellow] is installed but disabled")
+            label, remedy = "Enable with", f"specify extension enable {command_id}"
+        else:
+            console.print(
+                f"    [yellow]{extension_id}[/yellow] "
+                f"{_escape_markup(dep['installed'])} does not satisfy "
+                f"{_escape_markup(dep['version'])}"
+            )
+            label = "Needs"
+            remedy = (
+                f"a release of {command_id} satisfying "
+                f"{_escape_markup(dep['version'])}"
+            )
+        console.print(f"      {label}: {remedy}")
+        needs_catalog = needs_catalog or uses_catalog
+    console.print()
+    # The consequence differs by reason and must not be overstated. An
+    # unavailable extension contributes nothing, so those features are simply
+    # inert. A version mismatch is the opposite: the extension is installed and
+    # enabled, so the preset does invoke it -- the combination is just untested
+    # against the declared constraint, which is not the same as "safe".
+    console.print("[dim]The preset is installed.[/dim]")
+    if any(
+        dep["reason"] in ("missing", "corrupt", "stale", "disabled")
+        for dep in unmet
+    ):
+        console.print(
+            "[dim]Anything relying on an unavailable extension does nothing "
+            "until that is resolved.[/dim]"
+        )
+    if any(dep["reason"] == "version" for dep in unmet):
+        console.print(
+            "[dim]Where only a version constraint is unmet the extension is "
+            "still used, so it may not behave as the preset expects.[/dim]"
+        )
+    if needs_catalog:
+        # `extension add <id>` resolves through the catalogs, and the default
+        # community catalog is discovery-only, so installing by id is refused
+        # for anything listed only there -- true of every extension motivating
+        # this feature. Knowing which applies would mean a catalog fetch, and
+        # this runs on an install path that touches no network, so describe
+        # the outcome instead of asserting the command succeeds. The rejection
+        # itself prints the exact --from form, so this is a signpost rather
+        # than a dead end.
+        console.print(
+            "[dim]If an extension is listed only in a discovery-only catalog, "
+            "that command is refused and prints the "
+            "--from <archive-url> form to use instead.[/dim]"
+        )
 
 
 # ===== Preset Commands =====
@@ -54,23 +165,41 @@ def preset_list():
         console.print("  [cyan]specify preset add <pack-name>[/cyan]")
         return
 
-    console.print("\n[bold cyan]Installed Presets:[/bold cyan]\n")
+    # Sort by actual resolution precedence: lower priority number wins, ties
+    # broken by preset id (matching PresetRegistry.list_by_priority()). This
+    # keeps the printed order aligned with how presets are composed/resolved.
+    installed = sorted(
+        installed,
+        key=lambda pack: (pack.get("priority", 10), str(pack.get("id", ""))),
+    )
+
+    console.print("\n[bold cyan]Installed Presets[/bold cyan] [dim](in resolution order — highest precedence first)[/dim]\n")
     for pack in installed:
         status = "[green]enabled[/green]" if pack.get("enabled", True) else "[red]disabled[/red]"
         pri = pack.get('priority', 10)
-        console.print(f"  [bold]{pack['name']}[/bold] ({pack['id']}) v{pack['version']} — {status} — priority {pri}")
-        console.print(f"    {pack['description']}")
-        if pack.get("tags"):
-            tags_str = ", ".join(pack["tags"])
+        name = _escape_markup(str(pack['name']))
+        pack_id = _escape_markup(str(pack['id']))
+        version = _escape_markup(str(pack['version']))
+        console.print(f"  [bold]{name}[/bold] ({pack_id}) v{version} — {status} — priority {pri}")
+        console.print(f"    {_escape_markup(str(pack['description']))}")
+        tags = pack.get("tags", [])
+        if isinstance(tags, list) and tags:
+            tags_str = _escape_markup(", ".join(str(t) for t in tags))
             console.print(f"    [dim]Tags: {tags_str}[/dim]")
         console.print(f"    [dim]Templates: {pack['template_count']}[/dim]")
         console.print()
+
+    console.print("[dim]Lower priority number = higher precedence. Ties are broken by preset id (alphabetical).[/dim]")
 
 
 @preset_app.command("add")
 def preset_add(
     preset_id: str = typer.Argument(None, help="Preset ID to install from catalog"),
-    from_url: str = typer.Option(None, "--from", help="Install from a URL (ZIP file)"),
+    from_url: str = typer.Option(
+        None,
+        "--from",
+        help="Install from a .zip, .tar.gz, or .tgz URL",
+    ),
     dev: str = typer.Option(None, "--dev", help="Install from local directory (development mode)"),
     priority: int = typer.Option(10, "--priority", help="Resolution priority (lower = higher precedence, default 10)"),
 ):
@@ -126,18 +255,18 @@ def preset_add(
 
             if not is_https_or_localhost_http(from_url):
                 console.print(
-                    "[red]Error:[/red] URL must use HTTPS with a hostname, "
-                    "or HTTP for localhost/loopback."
+                    "[red]Error:[/red] URL must use HTTPS with a hostname and be "
+                    "a valid URL with a host. HTTP is only allowed for localhost, "
+                    "127.0.0.1, and ::1."
                 )
                 raise typer.Exit(1)
 
             console.print(f"Installing preset from [cyan]{_escape_markup(from_url)}[/cyan]...")
             import urllib.error
             import tempfile
-            import shutil
 
             with tempfile.TemporaryDirectory() as tmpdir:
-                zip_path = Path(tmpdir) / "preset.zip"
+                archive_path = Path(tmpdir) / "preset.archive"
                 try:
                     from specify_cli.authentication.http import open_url as _open_url
                     from specify_cli.authentication.http import github_provider_hosts
@@ -162,19 +291,48 @@ def preset_add(
                             console.print(
                                 "[red]Error:[/red] Preset URL redirected to a disallowed URL: "
                                 f"{final_url}. Redirect targets must use HTTPS with a hostname, "
-                                "or HTTP for localhost/loopback."
+                                "or HTTP for localhost (127.0.0.1, ::1)."
                             )
                             raise typer.Exit(1)
-                        with zip_path.open("wb") as output:
-                            try:
-                                shutil.copyfileobj(response, output)
-                            except TypeError:
-                                output.write(response.read())
-                except urllib.error.URLError as e:
-                    console.print(f"[red]Error:[/red] Failed to download: {_escape_markup(str(e))}")
+                        archive_data = read_response_limited(
+                            response,
+                            error_type=PresetError,
+                            label=f"preset {from_url}",
+                        )
+                        content_type = (
+                            response.getheader("Content-Type")
+                            if hasattr(response, "getheader")
+                            else None
+                        )
+                    archive_path.write_bytes(archive_data)
+                    format_source = (
+                        final_url
+                        if archive_format_from_name(final_url) is not None
+                        else from_url
+                    )
+                    archive_format = detect_archive_format(
+                        archive_path,
+                        source_name=format_source,
+                        content_type=content_type,
+                        error_type=PresetError,
+                    )
+                    detected_path = archive_path.with_suffix(
+                        archive_suffix(archive_format)
+                    )
+                    os.replace(archive_path, detected_path)
+                    archive_path = detected_path
+                except (urllib.error.URLError, PresetError) as e:
+                    console.print(
+                        f"[red]Error:[/red] Failed to download: "
+                        f"{_escape_markup(str(e))}"
+                    )
                     raise typer.Exit(1)
 
-                manifest = manager.install_from_zip(zip_path, speckit_version, priority)
+                manifest = manager.install_from_zip(
+                    archive_path,
+                    speckit_version,
+                    priority,
+                )
 
             console.print(f"[green]✓[/green] Preset '{manifest.name}' v{manifest.version} installed (priority {priority})")
 
@@ -217,15 +375,25 @@ def preset_add(
                 console.print(f"Installing preset [cyan]{pack_info.get('name', preset_id)}[/cyan]...")
 
                 try:
-                    zip_path = catalog.download_pack(preset_id)
-                    manifest = manager.install_from_zip(zip_path, speckit_version, priority)
+                    archive_path = catalog.download_pack(preset_id)
+                    manifest = manager.install_from_zip(
+                        archive_path,
+                        speckit_version,
+                        priority,
+                    )
                     console.print(f"[green]✓[/green] Preset '{manifest.name}' v{manifest.version} installed (priority {priority})")
                 finally:
-                    if 'zip_path' in locals() and zip_path.exists():
-                        zip_path.unlink(missing_ok=True)
+                    if 'archive_path' in locals() and archive_path.exists():
+                        archive_path.unlink(missing_ok=True)
         else:
             console.print("[red]Error:[/red] Specify a preset ID, --from URL, or --dev path")
             raise typer.Exit(1)
+
+        # Every install path above binds `manifest` and the no-source branch
+        # exits, so one call here covers --dev, --from, and catalog installs
+        # alike. Warns rather than fails: the preset is installed and its
+        # overrides fall through to the core workflow without the extension.
+        _warn_unmet_extension_dependencies(manager, manifest)
 
     except PresetCompatibilityError as e:
         console.print(f"[red]Compatibility Error:[/red] {_escape_markup(str(e))}")
@@ -285,10 +453,16 @@ def preset_search(
 
     console.print(f"\n[bold cyan]Presets ({len(results)} found):[/bold cyan]\n")
     for pack in results:
-        console.print(f"  [bold]{pack.get('name', pack['id'])}[/bold] ({pack['id']}) v{pack.get('version', '?')}")
-        console.print(f"    {pack.get('description', '')}")
-        if pack.get("tags"):
-            tags_str = ", ".join(pack["tags"])
+        name = _escape_markup(str(pack.get("name", pack["id"])))
+        pack_id = _escape_markup(str(pack["id"]))
+        version = _escape_markup(str(pack.get("version", "?")))
+        console.print(f"  [bold]{name}[/bold] ({pack_id}) v{version}")
+        console.print(
+            f"    {_escape_markup(str(pack.get('description', '')))}"
+        )
+        tags = pack.get("tags", [])
+        if isinstance(tags, list) and tags:
+            tags_str = _escape_markup(", ".join(str(t) for t in tags))
             console.print(f"    [dim]Tags: {tags_str}[/dim]")
         console.print()
 
@@ -301,16 +475,40 @@ def preset_resolve(
     from .. import _require_specify_project
     from . import PresetResolver
 
+    is_command = "." in template_name
+    valid_name = (
+        re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", template_name)
+        if is_command
+        else re.fullmatch(r"[a-z0-9-]+", template_name)
+    )
+    if valid_name is None:
+        typer.echo(
+            f"Error: invalid template name '{template_name}'; "
+            "use lowercase letters, digits, and hyphens, with non-empty "
+            "dot-separated segments for commands",
+            err=True,
+        )
+        raise typer.Exit(1)
+
     project_root = _require_specify_project()
     resolver = PresetResolver(project_root)
-    layers = resolver.collect_all_layers(template_name)
+    template_type = "command" if is_command else "template"
+
+    layers = resolver.collect_all_layers(template_name, template_type)
+    safe_template_name = _escape_markup(str(template_name))
 
     if layers:
         # Use the highest-priority layer for display because the final output
         # may be composed and may not map to resolve_with_source()'s single path.
         display_layer = layers[0]
-        console.print(f"  [bold]{template_name}[/bold]: {display_layer['path']}")
-        console.print(f"    [dim](top layer from: {display_layer['source']})[/dim]")
+        console.print(
+            f"  [bold]{safe_template_name}[/bold]: "
+            f"{_escape_markup(str(display_layer['path']))}"
+        )
+        console.print(
+            f"    [dim](top layer from: "
+            f"{_escape_markup(str(display_layer['source']))})[/dim]"
+        )
 
         has_composition = (
             layers[0]["strategy"] != "replace"
@@ -319,10 +517,13 @@ def preset_resolve(
         if has_composition:
             # Verify composition is actually possible
             try:
-                composed = resolver.resolve_content(template_name)
+                composed = resolver.resolve_content(template_name, template_type)
             except Exception as exc:
                 composed = None
-                console.print(f"    [yellow]Warning: composition error: {exc}[/yellow]")
+                console.print(
+                    f"    [yellow]Warning: composition error: "
+                    f"{_escape_markup(str(exc))}[/yellow]"
+                )
             if composed is None:
                 console.print("    [yellow]Warning: composition cannot produce output (no base layer with 'replace' strategy)[/yellow]")
             else:
@@ -345,15 +546,27 @@ def preset_resolve(
                 strategy_label = layer["strategy"]
                 if strategy_label == "replace" and i == 0:
                     strategy_label = "base"
-                console.print(f"    {i + 1}. [{strategy_label}] {layer['source']} → {layer['path']}")
+                # Escape the literal bracket (\[) so Rich renders `[<strategy>]`
+                # instead of parsing it as a style tag and swallowing the label,
+                # mirroring `workflow info`'s step-graph line.
+                console.print(
+                    f"    {i + 1}. \\[{_escape_markup(str(strategy_label))}] "
+                    f"{_escape_markup(str(layer['source']))} → "
+                    f"{_escape_markup(str(layer['path']))}"
+                )
     else:
         # No layers found — fall back to resolve_with_source for non-composition cases
-        result = resolver.resolve_with_source(template_name)
+        result = resolver.resolve_with_source(template_name, template_type)
         if result:
-            console.print(f"  [bold]{template_name}[/bold]: {result['path']}")
-            console.print(f"    [dim](from: {result['source']})[/dim]")
+            console.print(
+                f"  [bold]{safe_template_name}[/bold]: "
+                f"{_escape_markup(str(result['path']))}"
+            )
+            console.print(
+                f"    [dim](from: {_escape_markup(str(result['source']))})[/dim]"
+            )
         else:
-            console.print(f"  [yellow]{template_name}[/yellow]: not found")
+            console.print(f"  [yellow]{safe_template_name}[/yellow]: not found")
             console.print("    [dim]No template with this name exists in the resolution stack[/dim]")
 
 
@@ -367,28 +580,38 @@ def preset_info(
     from . import PresetCatalog, PresetManager, PresetError
 
     project_root = _require_specify_project()
+    safe_preset_id = _escape_markup(str(preset_id))
     # Check if installed locally first
     manager = PresetManager(project_root)
     local_pack = manager.get_pack(preset_id)
 
     if local_pack:
-        console.print(f"\n[bold cyan]Preset: {local_pack.name}[/bold cyan]\n")
-        console.print(f"  ID:          {local_pack.id}")
-        console.print(f"  Version:     {local_pack.version}")
-        console.print(f"  Description: {local_pack.description}")
+        console.print(
+            f"\n[bold cyan]Preset: {_escape_markup(str(local_pack.name))}[/bold cyan]\n"
+        )
+        console.print(f"  ID:          {_escape_markup(str(local_pack.id))}")
+        console.print(f"  Version:     {_escape_markup(str(local_pack.version))}")
+        console.print(
+            f"  Description: {_escape_markup(str(local_pack.description))}"
+        )
         if local_pack.author:
-            console.print(f"  Author:      {local_pack.author}")
-        if local_pack.tags:
-            console.print(f"  Tags:        {', '.join(local_pack.tags)}")
+            console.print(f"  Author:      {_escape_markup(str(local_pack.author))}")
+        local_tags = local_pack.tags
+        if isinstance(local_tags, list) and local_tags:
+            tags_str = _escape_markup(", ".join(str(t) for t in local_tags))
+            console.print(f"  Tags:        {tags_str}")
         console.print(f"  Templates:   {len(local_pack.templates)}")
         for tmpl in local_pack.templates:
-            console.print(f"    - {tmpl['name']} ({tmpl['type']}): {tmpl.get('description', '')}")
+            tmpl_name = _escape_markup(str(tmpl['name']))
+            tmpl_type = _escape_markup(str(tmpl['type']))
+            tmpl_desc = _escape_markup(str(tmpl.get('description', '')))
+            console.print(f"    - {tmpl_name} ({tmpl_type}): {tmpl_desc}")
         repo = local_pack.data.get("preset", {}).get("repository")
         if repo:
-            console.print(f"  Repository:  {repo}")
+            console.print(f"  Repository:  {_escape_markup(str(repo))}")
         license_val = local_pack.data.get("preset", {}).get("license")
         if license_val:
-            console.print(f"  License:     {license_val}")
+            console.print(f"  License:     {_escape_markup(str(license_val))}")
         console.print("\n  [green]Status: installed[/green]")
         # Get priority from registry
         pack_metadata = manager.registry.get(preset_id)
@@ -408,20 +631,33 @@ def preset_info(
         console.print(f"[red]Error:[/red] Preset '{preset_id}' not found (not installed and not in catalog)")
         raise typer.Exit(1)
 
-    console.print(f"\n[bold cyan]Preset: {pack_info.get('name', preset_id)}[/bold cyan]\n")
-    console.print(f"  ID:          {pack_info['id']}")
-    console.print(f"  Version:     {pack_info.get('version', '?')}")
-    console.print(f"  Description: {pack_info.get('description', '')}")
+    name = _escape_markup(str(pack_info.get("name", preset_id)))
+    console.print(f"\n[bold cyan]Preset: {name}[/bold cyan]\n")
+    console.print(f"  ID:          {_escape_markup(str(pack_info['id']))}")
+    console.print(
+        f"  Version:     {_escape_markup(str(pack_info.get('version', '?')))}"
+    )
+    console.print(
+        f"  Description: {_escape_markup(str(pack_info.get('description', '')))}"
+    )
     if pack_info.get("author"):
-        console.print(f"  Author:      {pack_info['author']}")
-    if pack_info.get("tags"):
-        console.print(f"  Tags:        {', '.join(pack_info['tags'])}")
+        console.print(
+            f"  Author:      {_escape_markup(str(pack_info['author']))}"
+        )
+    catalog_tags = pack_info.get("tags", [])
+    if isinstance(catalog_tags, list) and catalog_tags:
+        catalog_tags_str = _escape_markup(", ".join(str(t) for t in catalog_tags))
+        console.print(f"  Tags:        {catalog_tags_str}")
     if pack_info.get("repository"):
-        console.print(f"  Repository:  {pack_info['repository']}")
+        console.print(
+            f"  Repository:  {_escape_markup(str(pack_info['repository']))}"
+        )
     if pack_info.get("license"):
-        console.print(f"  License:     {pack_info['license']}")
+        console.print(
+            f"  License:     {_escape_markup(str(pack_info['license']))}"
+        )
     console.print("\n  [yellow]Status: not installed[/yellow]")
-    console.print(f"  Install with: [cyan]specify preset add {preset_id}[/cyan]")
+    console.print(f"  Install with: [cyan]specify preset add {safe_preset_id}[/cyan]")
     console.print()
 
 
@@ -580,10 +816,10 @@ def preset_catalog_list():
             if entry.install_allowed
             else "[yellow]discovery only[/yellow]"
         )
-        console.print(f"  [bold]{entry.name}[/bold] (priority {entry.priority})")
+        console.print(f"  [bold]{_escape_markup(str(entry.name))}[/bold] (priority {entry.priority})")
         if entry.description:
-            console.print(f"     {entry.description}")
-        console.print(f"     URL: {entry.url}")
+            console.print(f"     {_escape_markup(str(entry.description))}")
+        console.print(f"     URL: {_escape_markup(str(entry.url))}")
         console.print(f"     Install: {install_str}")
         console.print()
 
@@ -643,10 +879,15 @@ def preset_catalog_add(
     # Load existing config
     if config_path.exists():
         try:
-            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         except Exception as e:
             config_label = _display_project_path(project_root, config_path)
             console.print(f"[red]Error:[/red] Failed to read {_escape_markup(str(config_label))}: {_escape_markup(str(e))}")
+            raise typer.Exit(1)
+        if config is None:
+            config = {}
+        elif not isinstance(config, dict):
+            console.print("[red]Error:[/red] Invalid catalog config: expected a mapping.")
             raise typer.Exit(1)
     else:
         config = {}
@@ -656,10 +897,15 @@ def preset_catalog_add(
         console.print("[red]Error:[/red] Invalid catalog config: 'catalogs' must be a list.")
         raise typer.Exit(1)
 
+    # Only rendering is escaped — the raw values are what get persisted and
+    # compared below, so a name containing markup still round-trips exactly.
+    safe_name = _escape_markup(str(name))
+    safe_url = _escape_markup(str(url))
+
     # Check for duplicate name
     for existing in catalogs:
         if isinstance(existing, dict) and existing.get("name") == name:
-            console.print(f"[yellow]Warning:[/yellow] A catalog named '{name}' already exists.")
+            console.print(f"[yellow]Warning:[/yellow] A catalog named '{safe_name}' already exists.")
             console.print("Use 'specify preset catalog remove' first, or choose a different name.")
             raise typer.Exit(1)
 
@@ -675,10 +921,11 @@ def preset_catalog_add(
     config_path.write_text(yaml.safe_dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
     install_label = "install allowed" if install_allowed else "discovery only"
-    console.print(f"\n[green]✓[/green] Added catalog '[bold]{name}[/bold]' ({install_label})")
-    console.print(f"  URL: {url}")
+    console.print(f"\n[green]✓[/green] Added catalog '[bold]{safe_name}[/bold]' ({install_label})")
+    console.print(f"  URL: {safe_url}")
     console.print(f"  Priority: {priority}")
-    console.print(f"\nConfig saved to {_display_project_path(project_root, config_path)}")
+    config_label = _escape_markup(str(_display_project_path(project_root, config_path)))
+    console.print(f"\nConfig saved to {config_label}")
 
 
 @preset_catalog_app.command("remove")
@@ -697,26 +944,34 @@ def preset_catalog_remove(
         raise typer.Exit(1)
 
     try:
-        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        console.print("[red]Error:[/red] Failed to read preset catalog config.")
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        console.print(f"[red]Error:[/red] Failed to read preset catalog config: {e}")
+        raise typer.Exit(1)
+    if config is None:
+        config = {}
+    elif not isinstance(config, dict):
+        console.print("[red]Error:[/red] Invalid catalog config: expected a mapping.")
         raise typer.Exit(1)
 
     catalogs = config.get("catalogs", [])
     if not isinstance(catalogs, list):
         console.print("[red]Error:[/red] Invalid catalog config: 'catalogs' must be a list.")
         raise typer.Exit(1)
+    # Rendering only — the raw name drives the comparison below.
+    safe_name = _escape_markup(str(name))
+
     original_count = len(catalogs)
     catalogs = [c for c in catalogs if isinstance(c, dict) and c.get("name") != name]
 
     if len(catalogs) == original_count:
-        console.print(f"[red]Error:[/red] Catalog '{name}' not found.")
+        console.print(f"[red]Error:[/red] Catalog '{safe_name}' not found.")
         raise typer.Exit(1)
 
     config["catalogs"] = catalogs
     config_path.write_text(yaml.safe_dump(config, default_flow_style=False, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
-    console.print(f"[green]✓[/green] Removed catalog '{name}'")
+    console.print(f"[green]✓[/green] Removed catalog '{safe_name}'")
     if not catalogs:
         console.print("\n[dim]No catalogs remain in config. Built-in defaults will be used.[/dim]")
 

@@ -82,9 +82,49 @@ def clean_env() -> dict[str, str]:
     return env
 
 
+def collation_range_locale() -> str | None:
+    """A locale whose ``[a-z]`` bracket range is collation-ordered, or ``None``.
+
+    glibc resolves a bracket-expression *range* through the locale's collation
+    table, so under ``en_US.UTF-8`` ``[^a-z0-9]`` leaves accented lowercase
+    letters alone while ``C.UTF-8`` and the POSIX locale strip them. Probe
+    ``sed`` directly rather than trusting a locale name: the environments where
+    the divergence cannot be reproduced (no such locale installed, a non-glibc
+    libc, Git-for-Windows) are exactly the ones where the probe comes back
+    clean, so the caller can skip.
+    """
+    for name in ("en_US.UTF-8", "en_US.utf8"):
+        env = clean_env()
+        env["LC_ALL"] = name
+        env["LANG"] = name
+        try:
+            probe = subprocess.run(
+                ["sed", "s/[^a-z0-9]/-/g"],
+                input="é\n",
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+        except OSError:  # pragma: no cover - sed missing entirely
+            return None
+        if probe.returncode == 0 and "é" in probe.stdout:
+            return name
+    return None
+
+
 def run(
-    cmd: list[str], repo: Path, env: dict[str, str] | None = None
+    cmd: list[str],
+    repo: Path,
+    env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Run a script variant.
+
+    ``timeout`` guards cases whose regression mode is a hang rather than a bad
+    value; without it such a failure would stall the suite instead of failing
+    it. ``subprocess.TimeoutExpired`` propagates so the test reports the hang.
+    """
     return subprocess.run(
         cmd,
         cwd=repo,
@@ -92,6 +132,7 @@ def run(
         text=True,
         check=False,
         env=env if env is not None else clean_env(),
+        timeout=timeout,
     )
 
 
@@ -107,6 +148,67 @@ def write_feature_json(
         + "\n",
         encoding="utf-8",
     )
+
+
+def install_composition_stack(
+    repo: Path, template_name: str, core_content: str
+) -> str:
+    """Install wrap/prepend/append presets over a core template."""
+    templates = repo / ".specify" / "templates"
+    templates.mkdir(parents=True, exist_ok=True)
+    (templates / f"{template_name}.md").write_text(core_content, encoding="utf-8")
+
+    layers = [
+        ("wrap-pack", 1, "wrap", "## Wrapper\n{CORE_TEMPLATE}\n## End\n"),
+        ("prepend-pack", 2, "prepend", "# Prepended\n"),
+        ("append-pack", 3, "append", "# Appended\n"),
+    ]
+    registry: dict[str, object] = {"presets": {}}
+    registry_presets = registry["presets"]
+    assert isinstance(registry_presets, dict)
+
+    for preset_id, priority, strategy, content in layers:
+        preset_dir = repo / ".specify" / "presets" / preset_id
+        template_dir = preset_dir / "templates"
+        template_dir.mkdir(parents=True)
+        (template_dir / f"{template_name}.md").write_text(content, encoding="utf-8")
+        (preset_dir / "preset.yml").write_text(
+            "provides:\n"
+            "  templates:\n"
+            "    - type: template\n"
+            f"      name: {template_name}\n"
+            f"      file: templates/{template_name}.md\n"
+            f"      strategy: {strategy}\n",
+            encoding="utf-8",
+        )
+        registry_presets[preset_id] = {
+            "enabled": True,
+            "priority": priority,
+        }
+
+    (repo / ".specify" / "presets" / ".registry").write_text(
+        json.dumps(registry, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    appended = "# Appended\n"
+    prepended = "# Prepended\n"
+    wrapper = "## Wrapper\n{CORE_TEMPLATE}\n## End\n"
+    composed = f"{core_content}\n\n{appended}"
+    composed = f"{prepended}\n\n{composed}"
+    return wrapper.replace("{CORE_TEMPLATE}", composed)
+
+
+def break_wrap_layer(repo: Path, template_name: str) -> None:
+    """Replace the installed wrap layer with one missing its placeholder."""
+    (
+        repo
+        / ".specify"
+        / "presets"
+        / "wrap-pack"
+        / "templates"
+        / f"{template_name}.md"
+    ).write_text("# Broken wrapper\n", encoding="utf-8")
 
 
 def normalize_repo_paths(text: str, repo: Path) -> str:

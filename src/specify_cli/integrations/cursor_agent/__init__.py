@@ -38,6 +38,25 @@ class CursorAgentIntegration(SkillsIntegration):
 
     multi_install_safe = True
 
+    CANONICAL_TO_NATIVE = {
+        "session_start": "sessionStart",
+        "pre_tool_use": "preToolUse",
+        "post_tool_use": "postToolUse",
+        "session_end": "sessionEnd",
+        "user_prompt_submit": "beforeSubmitPrompt",
+        "stop": "stop",
+    }
+    events_config_file = ".cursor/hooks.json"
+    events_format = "json-flat"
+    # Cursor sessionStart injects a top-level additional_context (snake_case)
+    # field (C13). beforeSubmitPrompt has no context output field (block/allow
+    # only), and plain text on any hook fails Cursor's JSON parse — suppress
+    # everything else.
+    events_context_envelope = {
+        "*": "suppress",
+        "session_start": "additional_context",
+    }
+
     def build_exec_args(
         self,
         prompt: str,
@@ -92,11 +111,13 @@ class CursorAgentIntegration(SkillsIntegration):
 
     @classmethod
     def options(cls) -> list[IntegrationOption]:
-        return [
+        opts = super().options()
+        opts.append(
             IntegrationOption(
                 "--skills",
                 is_flag=True,
                 default=True,
                 help="Install as agent skills (recommended for Cursor)",
-            ),
-        ]
+            )
+        )
+        return opts

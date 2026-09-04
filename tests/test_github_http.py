@@ -42,6 +42,16 @@ class TestBuildGitHubRequest:
         with pytest.raises(ValueError, match="url must start with http"):
             build_github_request("ftp://github.com/file.zip")
 
+    @pytest.mark.parametrize(
+        "url", ["https://github.com:notaport/file", "https://github.com:65536/file"]
+    )
+    def test_malformed_explicit_port_raises_before_request_construction(self, url):
+        """Malformed explicit ports are rejected before creating a Request."""
+        with patch("specify_cli._github_http.urllib.request.Request") as request:
+            with pytest.raises(ValueError):
+                build_github_request(url)
+        request.assert_not_called()
+
     # --- Valid URL Tests ---
 
     def test_valid_https_url_returns_request(self):
@@ -53,6 +63,14 @@ class TestBuildGitHubRequest:
         """build_github_request() must accept http:// URLs."""
         req = build_github_request("http://example.com/file")
         assert req.full_url == "http://example.com/file"
+
+    def test_valid_explicit_port_retains_url_method_and_github_auth(self):
+        """A valid explicit port retains normal GitHub request behavior."""
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "test-token", "GH_TOKEN": ""}):
+            req = build_github_request("https://github.com:8443/github/spec-kit")
+        assert req.full_url == "https://github.com:8443/github/spec-kit"
+        assert req.get_method() == "GET"
+        assert req.get_header("Authorization") == "Bearer test-token"
 
     # --- Auth Header Tests ---
 
@@ -378,6 +396,31 @@ class TestResolveGitHubReleaseAssetApiUrl:
         )
         assert result == "https://api.github.com/repos/org/repo/releases/assets/99"
         assert captured == ["https://api.github.com/repos/org/repo/releases/tags/v1.0"]
+
+    def test_tag_with_literal_slash_in_path(self):
+        """A tag containing a literal '/' (e.g. feature/v1.0.0) splits across
+        multiple URL path segments. The implementation must join all segments
+        between 'download/' and the asset name to reconstruct the full tag."""
+        captured_urls = []
+        asset_url = "https://api.github.com/repos/org/repo/releases/assets/77"
+
+        @contextmanager
+        def capturing_open(url, timeout=None, extra_headers=None):
+            captured_urls.append(url)
+            resp = MagicMock()
+            resp.read.side_effect = io.BytesIO(json.dumps({
+                "assets": [{"name": "asset.zip", "url": asset_url}]
+            }).encode()).read
+            yield resp
+
+        result = resolve_github_release_asset_api_url(
+            "https://github.com/org/repo/releases/download/feature/v1.0.0/asset.zip",
+            capturing_open,
+        )
+        assert result == asset_url
+        # Tag must be the full "feature/v1.0.0", not just "v1.0.0"
+        assert len(captured_urls) == 1
+        assert "releases/tags/feature%2Fv1.0.0" in captured_urls[0]
 
 
 class TestGitHubRedirectAuth:
