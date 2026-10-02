@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from contextvars import ContextVar
 from typing import Any
 
 
@@ -134,23 +135,33 @@ def _filter_from_json(value: Any) -> Any:
 _EXPR_PATTERN = re.compile(r"\{\{(.+?)\}\}")
 
 
+# The one definition of an indexed path segment. _resolve_dot_path matches
+# against it, and the condition gate below reuses it rather than describing the
+# same shape a second time, so widening what indexing accepts cannot leave the
+# evaluator and the gate disagreeing.
+_INDEXED_SEGMENT = re.compile(r"^([\w-]+)\[(-?\d+)\]$")
+
+_PLAIN_SEGMENT = re.compile(r"^[\w-]+$")
+
+
 def _resolve_dot_path(obj: Any, path: str) -> Any:
     """Resolve a dotted path like ``steps.specify.output.file`` against *obj*.
 
-    Supports dict key access and list indexing (e.g., ``task_list[0]``).
+    Supports dict key access and list indexing, including the negative form
+    Python and Jinja2 both accept (e.g., ``task_list[0]``, ``task_list[-1]``).
     """
     parts = path.split(".")
     current = obj
     for part in parts:
-        # Handle list indexing: name[0]
-        idx_match = re.match(r"^([\w-]+)\[(\d+)\]$", part)
+        # Handle list indexing: name[0], name[-1]
+        idx_match = _INDEXED_SEGMENT.match(part)
         if idx_match:
             key, idx = idx_match.group(1), int(idx_match.group(2))
             if isinstance(current, dict):
                 current = current.get(key)
             else:
                 return None
-            if isinstance(current, list) and 0 <= idx < len(current):
+            if isinstance(current, list) and -len(current) <= idx < len(current):
                 current = current[idx]
             else:
                 return None
@@ -406,6 +417,41 @@ def _find_top_level(text: str, token: str) -> int:
     return -1
 
 
+def _is_single_list_literal(expr: str) -> bool:
+    """Return ``True`` only when *expr* is exactly one bracketed list
+    literal -- the opening ``[`` closes at the FINAL character, not partway
+    through the string.
+
+    ``expr.startswith("[") and expr.endswith("]")`` alone also matches a
+    list literal immediately followed by an index suffix, e.g.
+    ``[1,2,3][1]`` (meant as "index 1 of [1,2,3]", i.e. 2). Naively
+    stripping the outer brackets from that string yields the garbage
+    ``1,2,3][1``, which then silently evaluates to ``[1, 2, None]`` instead
+    of raising or resolving the index -- the same "grabs the wrong span"
+    failure mode the string-literal check above guards against, just never
+    given the same treatment for brackets.
+    """
+    if not (expr.startswith("[") and expr.endswith("]")):
+        return False
+    quote: str | None = None
+    depth = 0
+    n = len(expr)
+    for i, ch in enumerate(expr):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i == n - 1
+    return False
+
+
 def _apply_filter(value: Any, filter_expr: str, namespace: dict[str, Any]) -> Any:
     """Apply a single pipe filter segment to *value*.
 
@@ -440,6 +486,28 @@ def _apply_filter(value: Any, filter_expr: str, namespace: dict[str, Any]) -> An
     # branch above. The greedy ``.+`` still handles literal ``)`` and ``|``
     # inside quoted args.
     filter_match = re.fullmatch(r"(\w+)\((.+)\)", filter_expr)
+    # A multi-argument call is not a supported form: every filter here takes
+    # exactly one argument, and the whole captured argument text was handed to
+    # ``_evaluate_simple_expression`` as ONE expression. "1, 2" is not a valid
+    # expression, so it evaluated to None -- making ``default(1, 2)`` return
+    # None (silently wrong) and ``join(",", "extra")`` raise a message blaming
+    # the separator rather than the extra argument. Fall through to the
+    # unsupported-form error below instead, which names the filter and lists
+    # the accepted forms.
+    #
+    # Use ``_find_top_level``, the same scanner the operator splitting uses: it
+    # skips commas inside quotes AND inside nested brackets, so a single
+    # argument that happens to contain a comma still works -- ``join(", ")``,
+    # ``default("a, b")``, and the list literals the evaluator supports
+    # (``default([1, 2])``).
+    #
+    # List literals are the only container form ``_evaluate_simple_expression``
+    # implements; a mapping such as ``{"a": 1}`` has no branch there and falls
+    # through to dot-path resolution, which yields ``None``. The scanner does
+    # skip commas inside braces too, so nothing here changes if that ever gains
+    # support -- but do not read this comment as a promise that it exists.
+    if filter_match and _find_top_level(filter_match.group(2), ",") != -1:
+        filter_match = None
     if filter_match:
         fname = filter_match.group(1)
         farg = _evaluate_simple_expression(filter_match.group(2).strip(), namespace)
@@ -479,6 +547,70 @@ def _apply_filter(value: Any, filter_expr: str, namespace: dict[str, Any]) -> An
 # evaluator will actually split on.
 _COMPARISON_OPERATORS = ("!=", "==", ">=", "<=", ">", "<", " not in ", " in ")
 
+# Set only while `_collect_leaves` probes an expression; None everywhere else, so
+# a normal evaluation costs one `.get()`. A ContextVar rather than a module global
+# so concurrent probes cannot append into each other's list.
+_leaf_sink: ContextVar[list[str] | None] = ContextVar("_leaf_sink", default=None)
+
+
+def _is_wrapped_in_parens(text: str) -> bool:
+    """True when *text* is one parenthesised group, brackets and all.
+
+    ``(a or b)`` is; ``(a) and (b)`` is not, because the opening paren closes
+    before the end. Quote-aware, so ``('(')`` does not count its own literal.
+    """
+    if not (text.startswith("(") and text.endswith(")")):
+        return False
+    quote: str | None = None
+    depth = 0
+    for index, ch in enumerate(text):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return index == len(text) - 1
+    return False
+
+
+def _collapse_whitespace(text: str) -> str:
+    """Strip *text* and turn each run of whitespace outside a quoted string into
+    one space.
+
+    The operator scans below match word operators by their surrounding spaces
+    (``" or "``, ``" not in "``, ``expr.startswith("not ")``), so an operator
+    next to a newline or tab was never found. A condition wrapped across lines
+    in YAML keeps those newlines -- a ``|`` block scalar keeps every one, and a
+    ``>`` folded scalar keeps the break before a more-indented continuation
+    line -- so ``{{ inputs.a or\\n   inputs.b }}`` was resolved as one dot path,
+    came back ``None``, and read false with no error. Jinja2 treats any
+    whitespace between tokens alike; so does this, while quoted operands keep
+    their text exactly.
+    """
+    out: list[str] = []
+    quote: str | None = None
+    pending_space = False
+    for ch in text.strip():
+        if quote is not None:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch.isspace():
+            pending_space = True
+        else:
+            if pending_space:
+                out.append(" ")
+                pending_space = False
+            if ch in ("'", '"'):
+                quote = ch
+            out.append(ch)
+    return "".join(out)
+
 
 def _evaluate_simple_expression(expr: str, namespace: dict[str, Any]) -> Any:
     """Evaluate a simple expression against the namespace.
@@ -491,7 +623,7 @@ def _evaluate_simple_expression(expr: str, namespace: dict[str, Any]) -> Any:
     - Pipe filters: ``| default('...')``, ``| join(', ')``, ``| contains('...')``, ``| from_json``, ``| map('...')``
     - String and numeric literals
     """
-    expr = expr.strip()
+    expr = _collapse_whitespace(expr)
 
     # String literal — only when the WHOLE expression is one quoted string,
     # i.e. the opening quote's matching close is the final character. Checking
@@ -500,6 +632,16 @@ def _evaluate_simple_expression(expr: str, namespace: dict[str, Any]) -> Any:
     # strings containing `|` or operator keywords are not mis-parsed downstream.
     if expr[:1] in ("'", '"') and expr.find(expr[0], 1) == len(expr) - 1:
         return expr[1:-1]
+
+    # A parenthesised group. The operator scans below deliberately skip over
+    # bracketed text so an operator inside a quoted or nested operand is not
+    # split on -- which also means nothing ever looked inside a group that
+    # wraps the WHOLE expression. `(a or b) and c` split at the top-level
+    # `and`, then evaluated `(a or b)` as a dot path, found no such key, and
+    # returned None: the `or` was never evaluated and the whole thing read
+    # false. Unwrap here so grouping means what it says.
+    if _is_wrapped_in_parens(expr):
+        return _evaluate_simple_expression(expr[1:-1], namespace)
 
     # Handle pipe filters. Detect the pipe at the top level only, so a literal
     # '|' inside a quoted operand (e.g. `inputs.x == 'a|b'`) or nested brackets is
@@ -545,8 +687,27 @@ def _evaluate_simple_expression(expr: str, namespace: dict[str, Any]) -> Any:
                 f"operand in its own expression instead."
             )
         value = _evaluate_simple_expression(head, namespace)
+        sink = _leaf_sink.get()
         for segment in segments[1:]:
-            value = _apply_filter(value, segment.strip(), namespace)
+            if sink is None:
+                value = _apply_filter(value, segment.strip(), namespace)
+                continue
+            # Probing. A filter handed a placeholder can raise on it -- from_json
+            # on a mapping is the common one -- and letting that end the walk
+            # hides every leaf further along the chain, which is the one thing
+            # this collection exists to report: `inputs.blob | from_json |
+            # contains(bogus)` recorded `inputs.blob` and stopped, so `bogus`
+            # was never offered to _unresolvable_leaf. _apply_filter evaluates a
+            # filter's argument before it can raise on the value, so the leaves
+            # of the failing segment are already recorded when we get here.
+            # Carry a fresh placeholder so the next filter sees the same kind of
+            # unknown the namespace hands out. Real evaluation is untouched: the
+            # sink is armed only by _collect_leaves, and _evaluator_rejects runs
+            # its own probe without it, so a mis-wired filter is still reported.
+            try:
+                value = _apply_filter(value, segment.strip(), namespace)
+            except Exception:  # noqa: BLE001 - probe values, not the author's text
+                value = _ProbeNamespace()
         return value
 
     # Boolean operators — parse 'or' first (lower precedence) so that
@@ -613,7 +774,7 @@ def _evaluate_simple_expression(expr: str, namespace: dict[str, Any]) -> Any:
         return None
 
     # List literal (simple)
-    if expr.startswith("[") and expr.endswith("]"):
+    if _is_single_list_literal(expr):
         inner = expr[1:-1].strip()
         if not inner:
             return []
@@ -627,7 +788,12 @@ def _evaluate_simple_expression(expr: str, namespace: dict[str, Any]) -> Any:
         ]
         return items
 
-    # Variable reference (dot-path)
+    # Variable reference (dot-path). This is the one place a substring stops being
+    # grammar and becomes a name to resolve, so it is where a probe can learn what
+    # the evaluator will actually look up. Literals have all returned above.
+    sink = _leaf_sink.get()
+    if sink is not None:
+        sink.append(expr)
     return _resolve_dot_path(namespace, expr)
 
 
@@ -1047,8 +1213,9 @@ def _has_incomplete_operand(text: str) -> bool:
 # None, so a correction built on one turns a truthy condition false.
 _NAMESPACE_ROOTS = ("inputs", "steps", "item", "fan_in", "context")
 
-# Exactly what _resolve_dot_path accepts: a name, optionally one numeric index.
-_PATH_SEGMENT = re.compile(r"^[\w-]+(\[\d+\])?$")
+def _is_path_segment(segment: str) -> bool:
+    """Whether _resolve_dot_path can walk *segment*: a name, or a name it indexes."""
+    return bool(_PLAIN_SEGMENT.match(segment) or _INDEXED_SEGMENT.match(segment))
 
 
 class _ProbeNamespace(dict):
@@ -1097,115 +1264,43 @@ def _evaluator_rejects(text: str) -> str | None:
 
 
 
-def _looks_numeric(text: str) -> bool:
-    """Mirror the evaluator's numeric literal test exactly.
+def _collect_leaves(text: str) -> list[str]:
+    """Every substring *text* hands to the evaluator as a name to resolve.
 
-    `_evaluate_simple_expression` only calls `float()` when a `.` is present and
-    `int()` otherwise, so `1e3` is not a number to it -- it falls through to a path
-    lookup and resolves to None. A bare `float()` here accepted `1e3` and the
-    correction turned a truthy condition false.
+    Runs the same probe ``_evaluator_rejects`` uses, with the leaf sink armed.
+    Literals never reach the dot-path resolution, and operands, filter arguments
+    and list elements all do -- ``_evaluate_simple_expression`` evaluates both
+    sides of ``or``/``and`` eagerly rather than short-circuiting, so a leaf is
+    recorded whatever the other side is worth.
+
+    A probe run can still raise on its own placeholder values, which is what
+    ``_evaluator_rejects`` sorts out. The leaves seen before that point are real
+    -- the evaluator reached them -- so they are kept rather than discarded:
+    ``inputs.tags | join(bogus)`` records ``bogus`` and only then trips over the
+    placeholder handed to ``join``.
     """
+    leaves: list[str] = []
+    token = _leaf_sink.set(leaves)
     try:
-        if "." in text:
-            float(text)
-        else:
-            int(text)
-    except (ValueError, TypeError):
-        return False
-    return True
+        _evaluate_simple_expression(
+            text, {root: _ProbeNamespace() for root in _NAMESPACE_ROOTS}
+        )
+    except Exception:  # noqa: BLE001 - probe values, reported by _evaluator_rejects
+        pass
+    finally:
+        _leaf_sink.reset(token)
+    return leaves
 
 
-def _is_literal(text: str) -> bool:
-    """Mirror the evaluator's literal tests exactly.
+def _unresolvable_leaf(leaf: str) -> str | None:
+    """Why the evaluator cannot resolve the name *leaf*, or ``None``.
 
-    The string case is the opening quote's *matching close being the final
-    character*, not first/last-character equality: `'a' 'b'` passes the latter but
-    is two literals to the evaluator, which falls through to a path lookup.
+    Namespace knowledge only. Everything about where operands live now comes from
+    the evaluator itself, so nothing here restates the grammar.
     """
-    if text[:1] in ("'", '"') and text.find(text[0], 1) == len(text) - 1:
-        return True
-    return text.lower() in ("true", "false", "none", "null") or _looks_numeric(text)
-
-
-def _unresolvable_term(text: str) -> str | None:
-    """The first operand in *text* the evaluator cannot resolve, or ``None``.
-
-    Walks operands the way ``_evaluate_simple_expression`` does -- filters, then
-    ``or``/``and``/``not``, then comparisons -- and checks each leaf. A leaf must be
-    a literal or a dotted path rooted in ``_NAMESPACE_ROOTS``.
-
-    Enumerating broken shapes is what made this take several rounds: each new gate
-    only knew the shapes named so far. ``inputs.a === inputs.b`` split cleanly on
-    ``==`` and looked complete, while the evaluator read ``= inputs.b`` as a path
-    and resolved it to ``None``; ``bogus == 'x'`` passed for the same reason one
-    level up. Recursing to the leaves covers both without naming either.
-    """
-    stripped = text.strip()
-    if not stripped:
-        return "an operand is empty"
-
-    if _find_top_level(stripped, "|") != -1:
-        segments = _split_top_level(stripped, "|")
-        reason = _unresolvable_term(segments[0])
-        if reason is not None:
-            return reason
-        # A filter argument is an ordinary operand to `_apply_filter`, which
-        # evaluates it with `_evaluate_simple_expression` like any other. Skipping
-        # it let `inputs.tags | join(bogus)` be offered as paste-ready: `bogus` is
-        # no namespace root, resolves to None, and the wrapped form then raises
-        # `join: expected a string separator, got NoneType`. Parse with the same
-        # pattern `_apply_filter` uses, so a form this does not recognize is left
-        # to the evaluator probe rather than guessed at here.
-        for segment in segments[1:]:
-            match = re.fullmatch(r"(\w+)\((.+)\)", segment.strip())
-            if match is None:
-                continue
-            reason = _unresolvable_term(match.group(2))
-            if reason is not None:
-                return reason
-        return None
-
-    for op in (" or ", " and "):
-        idx = _find_top_level(stripped, op)
-        if idx != -1:
-            return _unresolvable_term(stripped[:idx]) or _unresolvable_term(
-                stripped[idx + len(op):]
-            )
-
-    if stripped.startswith("not "):
-        return _unresolvable_term(stripped[4:])
-
-    for op in _COMPARISON_OPERATORS:
-        idx = _find_top_level(stripped, op)
-        if idx != -1:
-            return _unresolvable_term(stripped[:idx]) or _unresolvable_term(
-                stripped[idx + len(op):]
-            )
-
-    if _is_literal(stripped):
-        return None
-
-    # A list literal is a term the evaluator understands, and it recurses into the
-    # elements rather than resolving the brackets as a name. Not mirroring that
-    # denied the correction to `inputs.tag in ['x', 'y']` -- a condition wrapping
-    # repairs completely -- while reporting the list as an unresolvable name. The
-    # empty-segment skip matches `_evaluate_simple_expression`, which drops them so
-    # `[1, 2,]` is `[1, 2]` rather than `[1, 2, None]`.
-    if stripped.startswith("[") and stripped.endswith("]"):
-        inner = stripped[1:-1].strip()
-        if not inner:
-            return None
-        for element in _split_top_level_commas(inner):
-            if not element.strip():
-                continue
-            reason = _unresolvable_term(element)
-            if reason is not None:
-                return reason
-        return None
-
-    segments = _split_top_level(stripped, ".")
-    if not _PATH_SEGMENT.match(segments[0].strip()):
-        return f"{stripped!r} is not a name the evaluator can resolve"
+    segments = _split_top_level(leaf, ".")
+    if not _is_path_segment(segments[0].strip()):
+        return f"{leaf!r} is not a name the evaluator can resolve"
     # `item` is the only root that is not always a mapping: `StepContext.item` is
     # `Any` and a fan-out assigns the item value itself, so when that value is a
     # list `_resolve_dot_path` indexes it and `item[0] == 'x'` resolves. Every
@@ -1213,7 +1308,7 @@ def _unresolvable_term(text: str) -> str | None:
     # branch returns None for those however it is written -- so the index is
     # stripped for `item` alone rather than for roots in general.
     root = segments[0].strip()
-    indexed_root = re.fullmatch(r"([\w-]+)\[\d+\]", root)
+    indexed_root = _INDEXED_SEGMENT.match(root)
     if indexed_root is not None and indexed_root.group(1) == "item":
         root = indexed_root.group(1)
     if root not in _NAMESPACE_ROOTS:
@@ -1222,8 +1317,35 @@ def _unresolvable_term(text: str) -> str | None:
             f"({', '.join(_NAMESPACE_ROOTS)})"
         )
     for segment in segments[1:]:
-        if not _PATH_SEGMENT.match(segment.strip()):
+        if not _is_path_segment(segment.strip()):
             return f"{segment.strip()!r} is not a valid path segment"
+    return None
+
+
+def _unresolvable_term(text: str) -> str | None:
+    """The first name in *text* the evaluator cannot resolve, or ``None``.
+
+    Asks the evaluator which names it will look up, then applies the namespace
+    rules to those. The previous implementation derived the names itself by
+    re-walking the grammar -- filters, then ``or``/``and``/``not``, then
+    comparisons, then list literals -- and had to be kept in step with
+    ``_evaluate_simple_expression`` by hand.
+
+    That is what made this take several rounds: each round fixed one shape the
+    walk disagreed about (``inputs.a === inputs.b``, ``bogus == 'x'``, list
+    elements, filter arguments, a newline before ``and``) and nothing stopped the
+    next one. Reading the leaves off the evaluator removes the class rather than
+    another instance of it: the two cannot disagree about where the operands are
+    when only one of them decides.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return "an operand is empty"
+
+    for leaf in _collect_leaves(stripped):
+        reason = _unresolvable_leaf(leaf)
+        if reason is not None:
+            return reason
     return None
 
 
