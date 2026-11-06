@@ -19,7 +19,7 @@ from . import _commands
 
 @_commands.extension_app.command("add")
 def extension_add(
-    extension: str = typer.Argument(help="Extension name or path"),
+    extension: Optional[str] = typer.Argument(None, help="Extension name or path (optional when --from is given)"),
     dev: bool = typer.Option(False, "--dev", help="Install from local directory"),
     from_url: Optional[str] = typer.Option(None, "--from", help="Install from custom URL"),
     force: bool = typer.Option(False, "--force", help="Overwrite if already installed"),
@@ -33,6 +33,26 @@ def extension_add(
     # Typer supplies its OptionInfo object instead of a parsed option value.
     if not isinstance(version, str):
         version = None
+    # Same for the optional positional name when a caller omits it.
+    if not isinstance(extension, str):
+        extension = None
+
+    # The name is optional only for URL installs (``--from <url>``), where the
+    # archive's manifest supplies the extension ID. ``--dev`` needs a local
+    # path, and a catalog install needs a name to look up.
+    if extension is None and (dev or not from_url):
+        if dev:
+            console.print("[red]Error:[/red] --dev requires the path to a local extension directory.")
+        else:
+            console.print(
+                "[red]Error:[/red] Missing extension name or source. "
+                "Provide an extension name, or install from a URL with --from <url>."
+            )
+        console.print("\nUsage:")
+        console.print("  specify extension add <name>")
+        console.print("  specify extension add --from <url>")
+        console.print("  specify extension add --dev <path>")
+        raise typer.Exit(1)
 
     project_root = _commands._require_specify_project()
     # Validate priority
@@ -99,7 +119,8 @@ def extension_add(
             console.print("Cancelled")
             raise typer.Exit(0)
 
-    safe_extension = _escape_markup(extension)
+    # With ``--from`` and no name, describe the install by its source URL.
+    safe_extension = _escape_markup(extension if extension is not None else str(from_url))
 
     try:
         with console.status(f"[cyan]Installing extension: {safe_extension}[/cyan]"):
@@ -297,22 +318,9 @@ def extension_add(
         for warning in manifest.warnings:
             console.print(f"\n[yellow]⚠  Compatibility warning:[/yellow] {_escape_markup(str(warning))}")
 
-        selected_ai = _commands.load_init_options(project_root).get("ai")
-        is_cline = selected_ai == "cline"
-        is_forge = selected_ai == "forge"
-
-        if is_cline:
-            from specify_cli.integrations.cline import format_cline_command_name
-        if is_forge:
-            from specify_cli.integrations.forge import format_forge_command_name
-
         console.print("\n[bold cyan]Provided commands:[/bold cyan]")
         for cmd in manifest.commands:
-            cmd_name = cmd['name']
-            if is_cline:
-                cmd_name = format_cline_command_name(cmd_name)
-            elif is_forge:
-                cmd_name = format_forge_command_name(cmd_name)
+            cmd_name = _commands._registered_command_name(project_root, cmd['name'])
             console.print(f"  • {_escape_markup(str(cmd_name))} - {_escape_markup(str(cmd.get('description', '')))}")
 
         # Report agent skills registration
